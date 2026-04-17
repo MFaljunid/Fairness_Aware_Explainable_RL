@@ -17,7 +17,7 @@ class RecEnv:
 
     def __init__(self, train_path: str, meta_path: str,
                  emb_dim: int = 64, window: int = 10,
-                 fairness_lambda: float = 0.5, k: int = 10):
+                 fairness_lambda: float = 1.0, k: int = 10):
 
         self.train      = pd.read_csv(train_path)
         self.meta       = json.load(open(meta_path))
@@ -113,8 +113,7 @@ class RecEnv:
         if self.total_recs == 0:
             pop_penalty = 0.0
         else:
-            pop_penalty = self.item_exposure[item] / (self.total_recs + 1)
-
+            pop_penalty = np.log(1 + self.item_exposure[item])
         return r_relevance - self.fairness_lambda * (r_fairness + pop_penalty)
     def _relevance_reward(self, item: int) -> float:
         """
@@ -140,7 +139,8 @@ class RecEnv:
         expected_exposure = self.total_recs / self.n_items
         actual_exposure   = self.item_exposure[item]
         # return max(0.0, actual_exposure - expected_exposure) / (self.total_recs + 1)
-        return actual_exposure / (self.total_recs + 1)
+        # return actual_exposure / (self.total_recs + 1)
+        return actual_exposure / (expected_exposure + 1e-6)
     # ── Utilities ─────────────────────────────────────────────────────
 
     def load_pretrained_embeddings(self, embeddings: np.ndarray):

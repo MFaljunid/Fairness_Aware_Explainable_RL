@@ -144,3 +144,63 @@ for k, v in metrics.items():
 
 with open('results/rl_fairness.json', 'w') as f:
     json.dump({'model': 'RL-CF', **metrics}, f, indent=2)
+
+# ── Performance evaluation (same as BPR) ─────────────────────────────
+print("\nEvaluating RL Performance Metrics...")
+
+def precision_at_k(recommended, relevant, k):
+    return len(set(recommended[:k]) & set(relevant)) / k
+
+def recall_at_k(recommended, relevant, k):
+    if len(relevant) == 0:
+        return 0
+    return len(set(recommended[:k]) & set(relevant)) / len(relevant)
+
+def ndcg_at_k(recommended, relevant, k):
+    dcg = 0.0
+    for i, item in enumerate(recommended[:k]):
+        if item in relevant:
+            dcg += 1 / np.log2(i + 2)
+    idcg = sum(1 / np.log2(i + 2) for i in range(min(len(relevant), k)))
+    return dcg / idcg if idcg > 0 else 0
+
+# Load test data
+test_df = pd.read_csv('data/test.csv')
+user_groups = test_df.groupby('user_id')['item_id'].apply(list)
+
+ndcg10, ndcg20 = [], []
+recall10, recall20 = [], []
+precision10 = []
+
+for uid, relevant_items in user_groups.items():
+    uid = str(uid)
+    if uid not in recs:
+        continue
+
+    recommended = recs[uid]
+
+    ndcg10.append(ndcg_at_k(recommended, relevant_items, 10))
+    ndcg20.append(ndcg_at_k(recommended, relevant_items, 20))
+    recall10.append(recall_at_k(recommended, relevant_items, 10))
+    recall20.append(recall_at_k(recommended, relevant_items, 20))
+    precision10.append(precision_at_k(recommended, relevant_items, 10))
+
+print("\nRL Performance Metrics:")
+print(f"NDCG@10: {np.mean(ndcg10):.4f}")
+print(f"NDCG@20: {np.mean(ndcg20):.4f}")
+print(f"Precision@10: {np.mean(precision10):.4f}")
+print(f"Recall@10: {np.mean(recall10):.4f}")
+print(f"Recall@20: {np.mean(recall20):.4f}")
+
+# Save results
+perf_results = {
+    "model": "RL-CF",
+    "NDCG@10": float(np.mean(ndcg10)),
+    "NDCG@20": float(np.mean(ndcg20)),
+    "Precision@10": float(np.mean(precision10)),
+    "Recall@10": float(np.mean(recall10)),
+    "Recall@20": float(np.mean(recall20))
+}
+
+with open('results/rl_performance.json', 'w') as f:
+    json.dump(perf_results, f, indent=2)
