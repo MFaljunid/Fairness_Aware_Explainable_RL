@@ -1,8 +1,12 @@
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import json, os
+import json
 from collections import deque
 
 from rl_model.environment import RecEnv
@@ -10,21 +14,19 @@ from rl_model.policy import ActorCriticPolicy
 
 os.makedirs('results', exist_ok=True)
 
-# ── Hyperparameters ───────────────────────────────────────────────────
 CFG = {
     'emb_dim':          64,
     'hidden_dim':       256,
     'lr':               3e-4,
-    'gamma':            0.99,       # discount factor
-    'fairness_lambda':  0.1,        # fairness penalty weight in reward
+    'gamma':            0.99,
+    'fairness_lambda':  0.1,
     'n_episodes':       5000,
     'max_steps':        20,
     'log_every':        100,
     'save_every':       500,
-    'window':           10,         # history window for state
+    'window':           10,
 }
 
-# ── Init environment and policy ───────────────────────────────────────
 env = RecEnv(
     train_path='data/train.csv',
     meta_path='data/meta.json',
@@ -33,14 +35,13 @@ env = RecEnv(
     fairness_lambda=CFG['fairness_lambda']
 )
 
-policy = ActorCriticPolicy(
+policy    = ActorCriticPolicy(
     state_dim=CFG['emb_dim'],
     n_items=env.n_items,
     hidden_dim=CFG['hidden_dim']
 )
 optimizer = optim.Adam(policy.parameters(), lr=CFG['lr'])
 
-# ── Training loop (REINFORCE with baseline) ───────────────────────────
 episode_rewards = []
 recent_rewards  = deque(maxlen=100)
 
@@ -49,50 +50,49 @@ print(f"Users: {env.n_users}  |  Items: {env.n_items}")
 
 for episode in range(CFG['n_episodes']):
 
-    # Sample a random user each episode
-    user_id = np.random.randint(0, env.n_users)
-    state   = env.reset(user_id)
+    user_id    = np.random.randint(0, env.n_users)
+    state      = env.reset(user_id)
+    seen_items = list(env.user_history[user_id])
 
     log_probs, values, rewards = [], [], []
-    seen_items = list(env.user_history[user_id])
 
     for step in range(CFG['max_steps']):
         action, log_prob, value = policy.select_action(state, exclude_items=seen_items)
         next_state, reward, done, _ = env.step(action)
 
-        log_probs.append(log_prob)
-        values.append(value)
-        rewards.append(reward)
+        log_probs.append(log_prob)   # ← tensor, keeps grad
+        values.append(value)         # ← tensor, keeps grad
+        rewards.append(reward)       # ← float, fine
         seen_items.append(action)
         state = next_state
 
         if done:
             break
 
-    # ── Compute discounted returns ────────────────────────────────────
+    # ── Discounted returns ────────────────────────────────────────────
     returns = []
     G = 0.0
     for r in reversed(rewards):
         G = r + CFG['gamma'] * G
         returns.insert(0, G)
     returns = torch.FloatTensor(returns)
-    returns = (returns - returns.mean()) / (returns.std() + 1e-8)  # normalize
+    returns = (returns - returns.mean()) / (returns.std() + 1e-8)
 
-    # ── Compute losses ────────────────────────────────────────────────
-    log_probs_t = torch.FloatTensor(log_probs)
-    values_t    = torch.FloatTensor(values)
-    advantages  = returns - values_t.detach()
+    # ── Stack tensors — preserves grad_fn ────────────────────────────
+    log_probs_t = torch.stack(log_probs)   # ← stack, not FloatTensor()
+    values_t    = torch.stack(values)      # ← stack, not FloatTensor()
+    advantages  = (returns - values_t.detach())
 
+    # ── Losses ────────────────────────────────────────────────────────
     actor_loss  = -(log_probs_t * advantages).mean()
     critic_loss = nn.MSELoss()(values_t, returns)
     loss        = actor_loss + 0.5 * critic_loss
 
     optimizer.zero_grad()
-    loss.backward()
+    loss.backward()    # ← works now
     nn.utils.clip_grad_norm_(policy.parameters(), max_norm=0.5)
     optimizer.step()
 
-    # ── Logging ───────────────────────────────────────────────────────
     ep_reward = sum(rewards)
     episode_rewards.append(ep_reward)
     recent_rewards.append(ep_reward)
@@ -103,7 +103,6 @@ for episode in range(CFG['n_episodes']):
               f"Avg reward (last 100): {avg:.4f} | "
               f"Loss: {loss.item():.4f}")
 
-    # ── Save checkpoint ───────────────────────────────────────────────
     if (episode + 1) % CFG['save_every'] == 0:
         path = f"results/policy_ep{episode+1}.pt"
         torch.save(policy.state_dict(), path)
@@ -114,23 +113,24 @@ torch.save(policy.state_dict(), 'results/policy_final.pt')
 np.save('results/episode_rewards.npy', np.array(episode_rewards))
 print("\nTraining complete. Model saved to results/policy_final.pt")
 
-# ── Quick fairness evaluation after training ──────────────────────────
+# ── Fairness evaluation ───────────────────────────────────────────────
 from metrics.fairness_metrics import compute_all
 import pandas as pd
 
 print("\nEvaluating fairness on test users...")
-test   = pd.read_csv('data/test.csv')
+test = pd.read_csv('data/test.csv')
 policy.eval()
-recs   = {}
+recs = {}
 
-for uid in test['user_id'].unique():
-    state = env.reset(int(uid))
-    seen  = list(env.user_history[int(uid)])
-    topk  = []
-    for _ in range(10):
-        action, _, _ = policy.select_action(state, exclude_items=seen + topk)
-        topk.append(action)
-    recs[str(uid)] = topk
+with torch.no_grad():   # ← no gradients needed during evaluation
+    for uid in test['user_id'].unique():
+        state = env.reset(int(uid))
+        seen  = list(env.user_history[int(uid)])
+        topk  = []
+        for _ in range(10):
+            action, _, _ = policy.select_action(state, exclude_items=seen + topk)
+            topk.append(action)
+        recs[str(uid)] = topk
 
 item_pop = np.bincount(
     pd.read_csv('data/train.csv')['item_id'].values,

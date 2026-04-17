@@ -58,26 +58,28 @@ class ActorCriticPolicy(nn.Module):
         return logits, value
 
     def select_action(self, state: np.ndarray,
-                      exclude_items: list = None) -> tuple:
+                    exclude_items: list = None) -> tuple:
         """
         Sample an action from the policy.
-        Returns: (action, log_prob, state_value)
+        Returns: (action, log_prob_tensor, state_value_tensor)
         """
         state_t = torch.FloatTensor(state).unsqueeze(0)
         logits, value = self.forward(state_t)
 
-        # Mask already-seen items so the agent can't re-recommend
+        # Mask already-seen items
         if exclude_items:
             logits[0, exclude_items] = -1e9
 
         probs    = F.softmax(logits, dim=-1)
         dist     = torch.distributions.Categorical(probs)
         action   = dist.sample()
-        log_prob = dist.log_prob(action)
+        log_prob = dist.log_prob(action)   # ← keep as tensor, NOT .item()
 
-        return (action.item(),
-                log_prob.item(),
-                value.item())
+        return (
+            action.item(),       # int  — safe to use as index
+            log_prob,            # tensor with grad_fn ← THIS was the bug
+            value.squeeze()      # tensor with grad_fn
+        )
 
     def explain(self, state: np.ndarray, action: int,
                 item_embeddings: np.ndarray, top_k: int = 5) -> dict:

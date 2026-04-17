@@ -2,6 +2,9 @@ import numpy as np
 import pandas as pd
 import json
 from collections import defaultdict
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 class RecEnv:
     """
@@ -14,7 +17,7 @@ class RecEnv:
 
     def __init__(self, train_path: str, meta_path: str,
                  emb_dim: int = 64, window: int = 10,
-                 fairness_lambda: float = 0.1, k: int = 10):
+                 fairness_lambda: float = 0.5, k: int = 10):
 
         self.train      = pd.read_csv(train_path)
         self.meta       = json.load(open(meta_path))
@@ -92,16 +95,27 @@ class RecEnv:
 
     # ── Reward ────────────────────────────────────────────────────────
 
-    def _compute_reward(self, item: int) -> float:
-        """
-        Relevance reward + fairness penalty.
+    # def _compute_reward(self, item: int) -> float:
+    #     """
+    #     Relevance reward + fairness penalty.
 
-        R = R_relevance - lambda * R_fairness_violation
-        """
+    #     R = R_relevance - lambda * R_fairness_violation
+    #     """
+    #     r_relevance = self._relevance_reward(item)
+    #     r_fairness  = self._fairness_penalty(item)
+    #     return r_relevance - self.fairness_lambda * r_fairness
+
+    def _compute_reward(self, item: int) -> float:
         r_relevance = self._relevance_reward(item)
         r_fairness  = self._fairness_penalty(item)
-        return r_relevance - self.fairness_lambda * r_fairness
 
+        # 🔥 NEW: popularity penalty
+        if self.total_recs == 0:
+            pop_penalty = 0.0
+        else:
+            pop_penalty = self.item_exposure[item] / (self.total_recs + 1)
+
+        return r_relevance - self.fairness_lambda * (r_fairness + pop_penalty)
     def _relevance_reward(self, item: int) -> float:
         """
         Simulate click signal from implicit feedback.
@@ -125,8 +139,8 @@ class RecEnv:
             return 0.0
         expected_exposure = self.total_recs / self.n_items
         actual_exposure   = self.item_exposure[item]
-        return max(0.0, actual_exposure - expected_exposure) / (self.total_recs + 1)
-
+        # return max(0.0, actual_exposure - expected_exposure) / (self.total_recs + 1)
+        return actual_exposure / (self.total_recs + 1)
     # ── Utilities ─────────────────────────────────────────────────────
 
     def load_pretrained_embeddings(self, embeddings: np.ndarray):
