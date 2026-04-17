@@ -2,92 +2,100 @@ import numpy as np
 import pandas as pd
 import json
 from collections import defaultdict
-import sys
-import os
+import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+
 class RecEnv:
-    """
-    Recommendation environment for RL.
-
-    State  : history of last `window` item embeddings for a user (GRU input)
-    Action : item index to recommend (0 .. n_items-1)
-    Reward : +1 click, 0 no click, with optional fairness penalty
-    """
-
     def __init__(self, train_path: str, meta_path: str,
                  emb_dim: int = 64, window: int = 10,
-                 fairness_lambda: float = 1.0, k: int = 10):
+                 fairness_lambda: float = 0.1, k: int = 10):
 
-        self.train      = pd.read_csv(train_path)
-        self.meta       = json.load(open(meta_path))
-        self.n_users    = self.meta['n_users']
-        self.n_items    = self.meta['n_items']
-        self.emb_dim    = emb_dim
-        self.window     = window
-        self.k          = k
+        self.train           = pd.read_csv(train_path)
+        self.meta            = json.load(open(meta_path))
+        self.n_users         = self.meta['n_users']
+        self.n_items         = self.meta['n_items']
+        self.emb_dim         = emb_dim
+        self.window          = window
+        self.k               = k
         self.fairness_lambda = fairness_lambda
 
-        # Build user interaction history: {user_id: [item_id, ...]}
-        self.user_history = defaultdict(list)
+        # Build IMMUTABLE ground-truth history — never modify this
+        self._gt_history = defaultdict(list)
         for _, row in self.train.iterrows():
-            self.user_history[int(row['user_id'])].append(int(row['item_id']))
+            self._gt_history[int(row['user_id'])].append(int(row['item_id']))
 
-        # Random item embeddings — replace with pretrained BPR embeddings later
+        # Build ground-truth set for fast O(1) lookup
+        self._gt_set = {u: set(items) for u, items in self._gt_history.items()}
+
+        # Item embeddings — random for now, replace with BPR embeddings later
+        np.random.seed(42)
         self.item_embeddings = np.random.randn(self.n_items, emb_dim).astype(np.float32)
-        self.item_embeddings /= np.linalg.norm(
-            self.item_embeddings, axis=1, keepdims=True) + 1e-9
+        self.item_embeddings /= (np.linalg.norm(
+            self.item_embeddings, axis=1, keepdims=True) + 1e-9)
 
-        # Track item exposure for fairness reward
+        # Episode-level exposure — reset every episode
         self.item_exposure  = np.zeros(self.n_items, dtype=np.float32)
         self.total_recs     = 0
 
-        self.current_user   = None
-        self.current_step   = 0
-        self.max_steps      = 20     # max recommendations per episode
+        # Global exposure across all episodes — for fairness evaluation only
+        self.global_exposure = np.zeros(self.n_items, dtype=np.float32)
+
+        self.current_user    = None
+        self.current_step    = 0
+        self.max_steps       = 20
+        self._session_history = []   # items seen THIS episode only
 
     # ── Core RL interface ─────────────────────────────────────────────
 
     def reset(self, user_id: int = None):
-        """Start a new episode for a user. Returns initial state."""
         if user_id is None:
             user_id = np.random.randint(0, self.n_users)
 
-        self.current_user = user_id
-        self.current_step = 0
-        self.session_items = []      # items recommended this episode
+        self.current_user     = user_id
+        self.current_step     = 0
+        self._session_history = []
+
+        # Reset episode-level exposure tracking
+        self.item_exposure = np.zeros(self.n_items, dtype=np.float32)
+        self.total_recs    = 0
+
         return self._get_state()
 
     def step(self, action: int):
-        """
-        Take action (recommend item `action`).
-        Returns: (next_state, reward, done, info)
-        """
         assert self.current_user is not None, "Call reset() first"
 
         reward = self._compute_reward(action)
 
-        # Update history and exposure
-        self.user_history[self.current_user].append(action)
+        # Update SESSION history only — never touch ground-truth history
+        self._session_history.append(action)
+
+        # Update episode-level exposure
         self.item_exposure[action] += 1
         self.total_recs += 1
-        self.session_items.append(action)
+
+        # Update global exposure for evaluation
+        self.global_exposure[action] += 1
+
         self.current_step += 1
-
-        done = self.current_step >= self.max_steps
+        done       = self.current_step >= self.max_steps
         next_state = self._get_state()
-        info = {'user': self.current_user, 'item': action, 'step': self.current_step}
-
+        info       = {
+            'user':  self.current_user,
+            'item':  action,
+            'step':  self.current_step,
+            'reward': reward
+        }
         return next_state, reward, done, info
 
     # ── State ─────────────────────────────────────────────────────────
 
     def _get_state(self) -> np.ndarray:
         """
-        State = mean of last `window` item embeddings.
-        Shape: (emb_dim,)
+        State = mean of last `window` items from ground-truth history only.
+        Session items are NOT included — avoids history pollution.
         """
-        history = self.user_history[self.current_user]
+        history = self._gt_history[self.current_user]
         if len(history) == 0:
             return np.zeros(self.emb_dim, dtype=np.float32)
         recent = history[-self.window:]
@@ -95,58 +103,46 @@ class RecEnv:
 
     # ── Reward ────────────────────────────────────────────────────────
 
-    # def _compute_reward(self, item: int) -> float:
-    #     """
-    #     Relevance reward + fairness penalty.
-
-    #     R = R_relevance - lambda * R_fairness_violation
-    #     """
-    #     r_relevance = self._relevance_reward(item)
-    #     r_fairness  = self._fairness_penalty(item)
-    #     return r_relevance - self.fairness_lambda * r_fairness
-
     def _compute_reward(self, item: int) -> float:
+        """
+        R = R_relevance - lambda * R_fairness_penalty
+
+        Keeps relevance and fairness on similar scales.
+        """
         r_relevance = self._relevance_reward(item)
         r_fairness  = self._fairness_penalty(item)
+        return r_relevance - self.fairness_lambda * r_fairness
 
-        # 🔥 NEW: popularity penalty
-        if self.total_recs == 0:
-            pop_penalty = 0.0
-        else:
-            pop_penalty = np.log(1 + self.item_exposure[item])
-        return r_relevance - self.fairness_lambda * (r_fairness + pop_penalty)
     def _relevance_reward(self, item: int) -> float:
         """
-        Simulate click signal from implicit feedback.
-        +1 if item is in user's held-out interactions, else 0.
-        In a real system this would be a live click signal.
+        Binary reward: +1 if item is in user's ground-truth history.
+        No similarity fallback — random embeddings produce noise, not signal.
         """
-        if item in self.user_history[self.current_user]:
-            return 1.0
-        # Partial reward: item is similar to user history
-        state = self._get_state()
-        similarity = float(np.dot(state, self.item_embeddings[item]))
-        return max(0.0, similarity)
+        return 1.0 if item in self._gt_set[self.current_user] else 0.0
 
     def _fairness_penalty(self, item: int) -> float:
         """
-        Penalize recommending over-exposed items.
-        Uses Inverse Propensity Scoring (IPS) logic:
-        penalty is proportional to how over-exposed this item already is.
+        Penalize items that are over-exposed relative to uniform exposure.
+        Normalized to [0, 1] range so it stays on same scale as relevance.
         """
         if self.total_recs == 0:
             return 0.0
-        expected_exposure = self.total_recs / self.n_items
-        actual_exposure   = self.item_exposure[item]
-        # return max(0.0, actual_exposure - expected_exposure) / (self.total_recs + 1)
-        # return actual_exposure / (self.total_recs + 1)
-        return actual_exposure / (expected_exposure + 1e-6)
+        expected = self.total_recs / self.n_items
+        actual   = float(self.item_exposure[item])
+        excess   = max(0.0, actual - expected)
+        # Normalize: divide by expected so penalty is scale-free
+        return min(1.0, excess / (expected + 1e-9))
+
     # ── Utilities ─────────────────────────────────────────────────────
 
     def load_pretrained_embeddings(self, embeddings: np.ndarray):
-        """Load embeddings from a pretrained BPR or LightGCN model."""
-        assert embeddings.shape == (self.n_items, self.emb_dim)
+        assert embeddings.shape == (self.n_items, self.emb_dim), \
+            f"Expected ({self.n_items}, {self.emb_dim}), got {embeddings.shape}"
         self.item_embeddings = embeddings.astype(np.float32)
+
+    def get_excluded_items(self) -> list:
+        """Items to exclude from action selection (already seen this session)."""
+        return self._session_history.copy()
 
     def get_state_dim(self) -> int:
         return self.emb_dim

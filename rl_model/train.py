@@ -50,20 +50,19 @@ print(f"Users: {env.n_users}  |  Items: {env.n_items}")
 
 for episode in range(CFG['n_episodes']):
 
-    user_id    = np.random.randint(0, env.n_users)
-    state      = env.reset(user_id)
-    seen_items = list(env.user_history[user_id])
+    user_id = np.random.randint(0, env.n_users)
+    state   = env.reset(user_id)          # resets exposure + session history
 
     log_probs, values, rewards = [], [], []
 
     for step in range(CFG['max_steps']):
-        action, log_prob, value = policy.select_action(state, exclude_items=seen_items)
-        next_state, reward, done, _ = env.step(action)
+        excluded           = env.get_excluded_items()   # session items only
+        action, log_prob, value = policy.select_action(state, exclude_items=excluded)
+        next_state, reward, done, _ = env.step(action)  # env tracks session internally
 
-        log_probs.append(log_prob)   # ← tensor, keeps grad
-        values.append(value)         # ← tensor, keeps grad
-        rewards.append(reward)       # ← float, fine
-        seen_items.append(action)
+        log_probs.append(log_prob)
+        values.append(value)
+        rewards.append(reward)
         state = next_state
 
         if done:
@@ -78,10 +77,10 @@ for episode in range(CFG['n_episodes']):
     returns = torch.FloatTensor(returns)
     returns = (returns - returns.mean()) / (returns.std() + 1e-8)
 
-    # ── Stack tensors — preserves grad_fn ────────────────────────────
-    log_probs_t = torch.stack(log_probs)   # ← stack, not FloatTensor()
-    values_t    = torch.stack(values)      # ← stack, not FloatTensor()
-    advantages  = (returns - values_t.detach())
+    # ── Stack tensors ─────────────────────────────────────────────────
+    log_probs_t = torch.stack(log_probs)
+    values_t    = torch.stack(values)
+    advantages  = returns - values_t.detach()
 
     # ── Losses ────────────────────────────────────────────────────────
     actor_loss  = -(log_probs_t * advantages).mean()
@@ -89,7 +88,7 @@ for episode in range(CFG['n_episodes']):
     loss        = actor_loss + 0.5 * critic_loss
 
     optimizer.zero_grad()
-    loss.backward()    # ← works now
+    loss.backward()
     nn.utils.clip_grad_norm_(policy.parameters(), max_norm=0.5)
     optimizer.step()
 
@@ -118,18 +117,19 @@ from metrics.fairness_metrics import compute_all
 import pandas as pd
 
 print("\nEvaluating fairness on test users...")
-test = pd.read_csv('data/test.csv')
+test   = pd.read_csv('data/test.csv')
 policy.eval()
-recs = {}
+recs   = {}
 
-with torch.no_grad():   # ← no gradients needed during evaluation
+with torch.no_grad():
     for uid in test['user_id'].unique():
-        state = env.reset(int(uid))
-        seen  = list(env.user_history[int(uid)])
+        state = env.reset(int(uid))       # clean reset per user
         topk  = []
         for _ in range(10):
-            action, _, _ = policy.select_action(state, exclude_items=seen + topk)
+            action, _, _ = policy.select_action(
+                state, exclude_items=env.get_excluded_items())
             topk.append(action)
+            env._session_history.append(action)
         recs[str(uid)] = topk
 
 item_pop = np.bincount(
@@ -145,62 +145,52 @@ for k, v in metrics.items():
 with open('results/rl_fairness.json', 'w') as f:
     json.dump({'model': 'RL-CF', **metrics}, f, indent=2)
 
-# ── Performance evaluation (same as BPR) ─────────────────────────────
+# ── Performance evaluation ────────────────────────────────────────────
 print("\nEvaluating RL Performance Metrics...")
+
+def ndcg_at_k(recommended, relevant, k):
+    dcg  = sum(1 / np.log2(i + 2)
+               for i, item in enumerate(recommended[:k]) if item in set(relevant))
+    idcg = sum(1 / np.log2(i + 2) for i in range(min(len(relevant), k)))
+    return dcg / idcg if idcg > 0 else 0.0
+
+def recall_at_k(recommended, relevant, k):
+    if len(relevant) == 0: return 0.0
+    return len(set(recommended[:k]) & set(relevant)) / len(relevant)
 
 def precision_at_k(recommended, relevant, k):
     return len(set(recommended[:k]) & set(relevant)) / k
 
-def recall_at_k(recommended, relevant, k):
-    if len(relevant) == 0:
-        return 0
-    return len(set(recommended[:k]) & set(relevant)) / len(relevant)
-
-def ndcg_at_k(recommended, relevant, k):
-    dcg = 0.0
-    for i, item in enumerate(recommended[:k]):
-        if item in relevant:
-            dcg += 1 / np.log2(i + 2)
-    idcg = sum(1 / np.log2(i + 2) for i in range(min(len(relevant), k)))
-    return dcg / idcg if idcg > 0 else 0
-
-# Load test data
-test_df = pd.read_csv('data/test.csv')
+test_df     = pd.read_csv('data/test.csv')
 user_groups = test_df.groupby('user_id')['item_id'].apply(list)
 
-ndcg10, ndcg20 = [], []
-recall10, recall20 = [], []
-precision10 = []
+ndcg10, ndcg20, recall10, recall20, precision10 = [], [], [], [], []
 
 for uid, relevant_items in user_groups.items():
-    uid = str(uid)
-    if uid not in recs:
+    uid_str = str(uid)
+    if uid_str not in recs:
         continue
-
-    recommended = recs[uid]
-
+    recommended = recs[uid_str]
     ndcg10.append(ndcg_at_k(recommended, relevant_items, 10))
     ndcg20.append(ndcg_at_k(recommended, relevant_items, 20))
     recall10.append(recall_at_k(recommended, relevant_items, 10))
     recall20.append(recall_at_k(recommended, relevant_items, 20))
     precision10.append(precision_at_k(recommended, relevant_items, 10))
 
-print("\nRL Performance Metrics:")
-print(f"NDCG@10: {np.mean(ndcg10):.4f}")
-print(f"NDCG@20: {np.mean(ndcg20):.4f}")
-print(f"Precision@10: {np.mean(precision10):.4f}")
-print(f"Recall@10: {np.mean(recall10):.4f}")
-print(f"Recall@20: {np.mean(recall20):.4f}")
+print(f"\nRL Performance Metrics:")
+print(f"  NDCG@10      : {np.mean(ndcg10):.4f}")
+print(f"  NDCG@20      : {np.mean(ndcg20):.4f}")
+print(f"  Precision@10 : {np.mean(precision10):.4f}")
+print(f"  Recall@10    : {np.mean(recall10):.4f}")
+print(f"  Recall@20    : {np.mean(recall20):.4f}")
 
-# Save results
 perf_results = {
-    "model": "RL-CF",
-    "NDCG@10": float(np.mean(ndcg10)),
-    "NDCG@20": float(np.mean(ndcg20)),
-    "Precision@10": float(np.mean(precision10)),
-    "Recall@10": float(np.mean(recall10)),
-    "Recall@20": float(np.mean(recall20))
+    "model":         "RL-CF",
+    "NDCG@10":       round(float(np.mean(ndcg10)),       4),
+    "NDCG@20":       round(float(np.mean(ndcg20)),       4),
+    "Precision@10":  round(float(np.mean(precision10)),  4),
+    "Recall@10":     round(float(np.mean(recall10)),     4),
+    "Recall@20":     round(float(np.mean(recall20)),     4),
 }
-
 with open('results/rl_performance.json', 'w') as f:
     json.dump(perf_results, f, indent=2)
