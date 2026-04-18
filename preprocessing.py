@@ -1,63 +1,110 @@
 import pandas as pd
 import numpy as np
 import os
+import json
 
-os.makedirs('Data', exist_ok=True)
+DATA_DIR = 'data'
+os.makedirs(DATA_DIR, exist_ok=True)
 
-# ── 1. Load raw ratings ──────────────────────────────────────────────
+# ── 1. Load raw ratings ───────────────────────────────────────────────
 df = pd.read_csv(
-    'Data/ratings.dat',
+    os.path.join(DATA_DIR, 'ratings.dat'),
     sep='::',
     names=['user_id', 'item_id', 'rating', 'timestamp'],
     engine='python'
 )
-
-print(f"Raw data: {len(df)} interactions")
+print(f"Raw interactions      : {len(df)}")
 
 # ── 2. Convert to implicit feedback ──────────────────────────────────
-# Drop rating value — any interaction counts as a positive signal
-df = df[['user_id', 'item_id', 'timestamp']].drop_duplicates()
+df = (df[['user_id', 'item_id', 'timestamp']]
+      .sort_values('timestamp')
+      .drop_duplicates(subset=['user_id', 'item_id'], keep='last')
+      .copy())
 df['feedback'] = 1
+print(f"After dedup           : {len(df)}")
 
-# ── 3. Filter cold-start users/items (keep users with ≥ 5 interactions)
-user_counts = df['user_id'].value_counts()
-item_counts = df['item_id'].value_counts()
-df = df[df['user_id'].isin(user_counts[user_counts >= 5].index)]
-df = df[df['item_id'].isin(item_counts[item_counts >= 5].index)]
+# ── 3. Iterative cold-start filtering ────────────────────────────────
+MIN_INTERACTIONS = 5
+prev_len = -1
+iteration = 0
+while prev_len != len(df):
+    prev_len = len(df)
+    iteration += 1
+    user_counts = df['user_id'].value_counts()
+    item_counts = df['item_id'].value_counts()
+    df = df[df['user_id'].isin(user_counts[user_counts >= MIN_INTERACTIONS].index)]
+    df = df[df['item_id'].isin(item_counts[item_counts >= MIN_INTERACTIONS].index)]
 
-print(f"After filtering: {len(df)} interactions")
+print(f"After filtering ({iteration} iters): {len(df)} interactions")
 
-# ── 4. Re-index users and items to 0-based integers ──────────────────
-df['user_id'] = pd.Categorical(df['user_id']).codes
-df['item_id'] = pd.Categorical(df['item_id']).codes
+# ── 4. Deterministic re-indexing ─────────────────────────────────────
+sorted_users = sorted(df['user_id'].unique())
+sorted_items = sorted(df['item_id'].unique())
 
-n_users = df['user_id'].nunique()
-n_items = df['item_id'].nunique()
+user2idx = {int(u): int(i) for i, u in enumerate(sorted_users)}
+item2idx = {int(it): int(i) for i, it in enumerate(sorted_items)}
+
+df['user_id'] = df['user_id'].map(user2idx)
+df['item_id'] = df['item_id'].map(item2idx)
+
+n_users = len(sorted_users)
+n_items = len(sorted_items)
 print(f"Users: {n_users}  |  Items: {n_items}")
 
-# ── 5. Leave-one-out split (standard for implicit CF papers) ─────────
-# Sort by timestamp so the LAST interaction per user goes to test
-df = df.sort_values(['user_id', 'timestamp'])
+# ── 5. Sort before splitting ──────────────────────────────────────────
+df = df.sort_values(['user_id', 'timestamp']).reset_index(drop=True)
 
-test_df  = df.groupby('user_id').tail(1)          # 1 item per user → test
-train_df = df.drop(test_df.index)                 # everything else → train
+# ── 6. Leave-one-out split with validation ────────────────────────────
+# Fix: don't use include_groups — instead add split column directly
+df['split'] = 'train'
 
-print(f"Train: {len(train_df)}  |  Test: {len(test_df)}")
+# For each user mark last row as test, second-to-last as val
+for uid, group in df.groupby('user_id'):
+    idx = group.index.tolist()          # row indices for this user
+    df.loc[idx[-1], 'split'] = 'test'
+    if len(idx) >= 2:
+        df.loc[idx[-2], 'split'] = 'val'
 
-# ── 6. Save ───────────────────────────────────────────────────────────
-train_df[['user_id', 'item_id', 'feedback', 'timestamp']].to_csv(
-    'data/train.csv', index=False)
+train_df = df[df['split'] == 'train'].drop(columns='split').reset_index(drop=True)
+val_df   = df[df['split'] == 'val'].drop(columns='split').reset_index(drop=True)
+test_df  = df[df['split'] == 'test'].drop(columns='split').reset_index(drop=True)
 
-test_df[['user_id', 'item_id', 'feedback', 'timestamp']].to_csv(
-    'data/test.csv', index=False)
+print(f"Train: {len(train_df)}  |  Val: {len(val_df)}  |  Test: {len(test_df)}")
 
-# Save metadata — useful later for your RL environment
-meta = {'n_users': int(n_users), 'n_items': int(n_items)}
-import json
-with open('data/meta.json', 'w') as f:
+# ── 7. Sanity checks ──────────────────────────────────────────────────
+assert len(test_df) == n_users, "Every user must have exactly 1 test item"
+assert len(val_df)  == n_users, "Every user must have exactly 1 val item"
+
+train_users = set(train_df['user_id'])
+test_users  = set(test_df['user_id'])
+assert test_users == train_users, "Some test users missing from train"
+
+train_pairs = set(zip(train_df['user_id'], train_df['item_id']))
+test_pairs  = set(zip(test_df['user_id'],  test_df['item_id']))
+val_pairs   = set(zip(val_df['user_id'],   val_df['item_id']))
+assert len(train_pairs & test_pairs) == 0, "Train/test overlap detected"
+assert len(train_pairs & val_pairs)  == 0, "Train/val overlap detected"
+
+print("All sanity checks passed.")
+
+# ── 8. Save ───────────────────────────────────────────────────────────
+cols = ['user_id', 'item_id', 'feedback', 'timestamp']
+train_df[cols].to_csv(os.path.join(DATA_DIR, 'train.csv'), index=False)
+val_df[cols].to_csv(  os.path.join(DATA_DIR, 'val.csv'),   index=False)
+test_df[cols].to_csv( os.path.join(DATA_DIR, 'test.csv'),  index=False)
+
+meta = {
+    'n_users':          n_users,
+    'n_items':          n_items,
+    'min_interactions': MIN_INTERACTIONS,
+    'user2idx':         user2idx,
+    'item2idx':         item2idx,
+}
+with open(os.path.join(DATA_DIR, 'meta.json'), 'w') as f:
     json.dump(meta, f, indent=2)
 
-print("\nFiles saved:")
-print("  Data/train.csv")
-print("  Data/test.csv")
-print("  Data/meta.json")
+print(f"\nFiles saved to {DATA_DIR}/:")
+print(f"  train.csv  ({len(train_df)} rows)")
+print(f"  val.csv    ({len(val_df)} rows)")
+print(f"  test.csv   ({len(test_df)} rows)")
+print(f"  meta.json  (n_users={n_users}, n_items={n_items})")
