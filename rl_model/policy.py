@@ -48,15 +48,25 @@ class FairnessConstraintLayer(nn.Module):
         self.alpha     = nn.Parameter(torch.ones(1))
         self.user_proj = nn.Linear(hidden_dim, 1)
 
+    # def forward(self, logits: torch.Tensor,
+    #             state: torch.Tensor,
+    #             item_exposure: torch.Tensor) -> torch.Tensor:
+    #     exp_norm         = item_exposure / (item_exposure.max() + 1e-9)
+    #     fairness_penalty = exp_norm * self.alpha.abs()
+    #     user_sensitivity = torch.sigmoid(self.user_proj(state))
+    #     return logits - user_sensitivity * fairness_penalty.unsqueeze(0)
+
     def forward(self, logits: torch.Tensor,
                 state: torch.Tensor,
                 item_exposure: torch.Tensor) -> torch.Tensor:
-        exp_norm         = item_exposure / (item_exposure.max() + 1e-9)
-        fairness_penalty = exp_norm * self.alpha.abs()
+        exp_norm = torch.log1p(item_exposure)
+        exp_norm = exp_norm / (exp_norm.max() + 1e-9)
+        alpha = torch.softplus(self.alpha)
+        fairness_penalty = exp_norm * alpha
         user_sensitivity = torch.sigmoid(self.user_proj(state))
-        return logits - user_sensitivity * fairness_penalty.unsqueeze(0)
+        adjusted_logits = logits - user_sensitivity * fairness_penalty.unsqueeze(0)
 
-
+        return adjusted_logits
 class AttentionExplainer(nn.Module):
     """
     Step 5 — Attention-based explainability.
