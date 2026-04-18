@@ -5,152 +5,274 @@ import numpy as np
 
 
 class GRUStateEncoder(nn.Module):
-    """Encodes user interaction history into a fixed-size state vector."""
+    """
+    Step 2 — Encodes user interaction sequence into a state vector.
+    Captures temporal preference patterns.
 
-    def __init__(self, item_emb_dim: int, hidden_dim: int):
+    Input  : (batch, window, emb_dim)
+    Output : (batch, hidden_dim)
+    """
+    def __init__(self, emb_dim: int, hidden_dim: int,
+                 num_layers: int = 2, dropout: float = 0.1):
         super().__init__()
-        self.gru        = nn.GRU(item_emb_dim, hidden_dim, batch_first=True)
+        self.gru = nn.GRU(
+            input_size=emb_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0
+        )
+        self.norm       = nn.LayerNorm(hidden_dim)
         self.hidden_dim = hidden_dim
 
-    def forward(self, history: torch.Tensor) -> torch.Tensor:
-        # history: (batch, seq_len, emb_dim)
-        _, h_n = self.gru(history)
-        return h_n.squeeze(0)   # (batch, hidden_dim)
+    def forward(self, seq: torch.Tensor) -> torch.Tensor:
+        _, h_n = self.gru(seq)
+        return self.norm(h_n[-1])
+
+
+class FairnessConstraintLayer(nn.Module):
+    """
+    Step 3 — YOUR NOVELTY.
+
+    Subtracts a learned exposure penalty from actor logits
+    BEFORE the action distribution is computed.
+
+    Unlike reward shaping:
+      - Acts on logits directly — fairness is IN the policy
+      - Penalty strength alpha is LEARNED
+      - Per-user sensitivity is LEARNED via user_proj
+    """
+    def __init__(self, hidden_dim: int, n_items: int):
+        super().__init__()
+        self.n_items   = n_items
+        self.alpha     = nn.Parameter(torch.ones(1))
+        self.user_proj = nn.Linear(hidden_dim, 1)
+
+    def forward(self, logits: torch.Tensor,
+                state: torch.Tensor,
+                item_exposure: torch.Tensor) -> torch.Tensor:
+        exp_norm         = item_exposure / (item_exposure.max() + 1e-9)
+        fairness_penalty = exp_norm * self.alpha.abs()
+        user_sensitivity = torch.sigmoid(self.user_proj(state))
+        return logits - user_sensitivity * fairness_penalty.unsqueeze(0)
+
+
+class AttentionExplainer(nn.Module):
+    """
+    Step 5 — Attention-based explainability.
+
+    Answers: Which past interactions drove this recommendation?
+
+    Input  : gru_state (batch, hidden_dim)
+             history_embs (batch, window, emb_dim)
+    Output : attention_weights (batch, window)
+    """
+    def __init__(self, emb_dim: int, hidden_dim: int):
+        super().__init__()
+        self.query_proj = nn.Linear(hidden_dim, emb_dim)
+        self.scale      = emb_dim ** 0.5
+
+    def forward(self, gru_state: torch.Tensor,
+                history_embs: torch.Tensor) -> torch.Tensor:
+        query   = self.query_proj(gru_state).unsqueeze(2)
+        scores  = torch.bmm(history_embs, query).squeeze(2) / self.scale
+        return F.softmax(scores, dim=-1)
+
+    def explain(self, gru_state: torch.Tensor,
+                history_embs: torch.Tensor,
+                history_item_ids: list) -> dict:
+        weights    = self.forward(gru_state, history_embs)
+        weights_np = weights.squeeze(0).detach().numpy()
+        top_idx    = np.argsort(weights_np)[::-1]
+        top_items  = [history_item_ids[i] for i in top_idx
+                      if i < len(history_item_ids)]
+        top_w      = weights_np[top_idx].tolist()
+        return {
+            'attention_weights':     weights_np.tolist(),
+            'top_history_items':     top_items[:5],
+            'top_history_weights':   top_w[:5],
+            'most_influential_item': top_items[0],
+            'explanation': (
+                f"Recommended because of your interactions with "
+                f"items {top_items[:3]} "
+                f"(influence: {[round(w, 3) for w in top_w[:3]]})"
+            )
+        }
 
 
 class ActorCriticPolicy(nn.Module):
     """
-    Actor-Critic policy for fair recommendation.
+    Full policy combining all contributions:
 
-    Actor  : state → logits over all items → Categorical distribution
-    Critic : state → scalar V(s) for advantage estimation
+      GRUStateEncoder        — temporal user modelling
+      FairnessConstraintLayer — fairness IN the policy (novelty)
+      AttentionExplainer     — interpretable recommendations
     """
-
-    def __init__(self, state_dim: int, n_items: int, hidden_dim: int = 256):
+    def __init__(self, emb_dim: int, n_items: int,
+                 hidden_dim: int = 256, num_gru_layers: int = 2):
         super().__init__()
         self.n_items    = n_items
-        self.state_dim  = state_dim
+        self.emb_dim    = emb_dim
         self.hidden_dim = hidden_dim
 
-        # Shared trunk — processes state into features
-        self.trunk = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
+        self.item_emb       = nn.Embedding(n_items, emb_dim, padding_idx=0)
+        self.encoder        = GRUStateEncoder(emb_dim, hidden_dim, num_gru_layers)
+        self.trunk          = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU()
         )
-
-        # Actor head: one logit per item
-        self.actor  = nn.Linear(hidden_dim, n_items)
-
-        # Critic head: scalar state value
-        self.critic = nn.Linear(hidden_dim, 1)
+        self.actor          = nn.Linear(hidden_dim, n_items)
+        self.critic         = nn.Linear(hidden_dim, 1)
+        self.fairness_layer = FairnessConstraintLayer(hidden_dim, n_items)
+        self.attention      = AttentionExplainer(emb_dim, hidden_dim)
 
         self._init_weights()
 
     def _init_weights(self):
-        """Orthogonal init — helps Actor-Critic converge faster."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
                 nn.init.constant_(m.bias, 0.0)
-        # Actor output layer uses smaller gain so initial policy is near-uniform
-        nn.init.orthogonal_(self.actor.weight, gain=0.01)
+        nn.init.orthogonal_(self.actor.weight,  gain=0.01)
         nn.init.orthogonal_(self.critic.weight, gain=1.0)
+        nn.init.xavier_uniform_(self.fairness_layer.user_proj.weight)
+        nn.init.constant_(self.fairness_layer.user_proj.bias, 0.0)
 
-    def forward(self, state: torch.Tensor):
+    def forward(self, item_seq: torch.Tensor,
+                item_exposure: torch.Tensor) -> tuple:
         """
-        state : (batch, state_dim)
-        returns: logits (batch, n_items),  value (batch,)   ← 1-D, not 2-D
-        """
-        features = self.trunk(state)
-        logits   = self.actor(features)
-        value    = self.critic(features).squeeze(-1)   # (batch,) not (batch,1)
-        return logits, value
-
-    def select_action(self, state: np.ndarray,
-                      exclude_items: list = None) -> tuple:
-        """
-        Sample one action from the policy during a rollout.
+        item_seq      : (batch, window)   LongTensor — item ids
+        item_exposure : (n_items,)        FloatTensor — exposure counts
 
         Returns
         -------
-        action   : int               — item index to recommend
-        log_prob : torch.Tensor      — scalar tensor WITH grad_fn (for training)
-        value    : torch.Tensor      — scalar tensor WITH grad_fn (for training)
+        fair_logits  : (batch, n_items)
+        value        : (batch,)
+        gru_state    : (batch, hidden_dim)
+        attn_weights : (batch, window)
         """
-        state_t        = torch.FloatTensor(state).unsqueeze(0)  # (1, state_dim)
-        logits, value  = self.forward(state_t)                  # (1, n_items), (1,)
+        emb          = self.item_emb(item_seq)
+        gru_state    = self.encoder(emb)
+        features     = self.trunk(gru_state)
+        logits       = self.actor(features)
+        value        = self.critic(features).squeeze(-1)
+        fair_logits  = self.fairness_layer(logits, features, item_exposure)
+        attn_weights = self.attention(gru_state, emb)
+        return fair_logits, value, gru_state, attn_weights
 
-        # Clone before masking — avoids in-place mutation of the grad graph
+    def select_action(self, item_seq: np.ndarray,
+                      item_exposure: np.ndarray,
+                      exclude_items: list = None) -> tuple:
+        """
+        Sample action during training rollout.
+
+        Parameters
+        ----------
+        item_seq      : (window,) numpy int array
+        item_exposure : (n_items,) numpy float array
+
+        Returns: action (int), log_prob (tensor), value (tensor)
+        """
+        seq_t = torch.LongTensor(item_seq).unsqueeze(0)
+        exp_t = torch.FloatTensor(item_exposure)
+
+        logits, value, _, _ = self.forward(seq_t, exp_t)
         logits = logits.clone()
+
         if exclude_items and len(exclude_items) > 0:
             logits[0, exclude_items] = -1e9
 
-        probs    = F.softmax(logits, dim=-1)                    # (1, n_items)
+        probs    = F.softmax(logits, dim=-1)
         dist     = torch.distributions.Categorical(probs)
-        action   = dist.sample()                                # (1,)
-        log_prob = dist.log_prob(action)                        # (1,) with grad_fn
+        action   = dist.sample()
+        log_prob = dist.log_prob(action)
 
-        return (
-            action.item(),           # plain int — safe array index
-            log_prob.squeeze(),      # 0-dim tensor WITH grad_fn
-            value.squeeze()          # 0-dim tensor WITH grad_fn
-        )
+        return action.item(), log_prob.squeeze(), value.squeeze()
 
-    def greedy_action(self, state: np.ndarray,
+    def greedy_action(self, item_seq: np.ndarray,
+                      item_exposure: np.ndarray,
                       exclude_items: list = None) -> int:
-        """
-        Pick the highest-scoring item deterministically.
-        Use this during EVALUATION only — no gradients needed.
-        """
+        """Deterministic action for evaluation."""
+        training = self.training
+        self.eval()
         with torch.no_grad():
-            state_t       = torch.FloatTensor(state).unsqueeze(0)
-            logits, _     = self.forward(state_t)
-            logits        = logits.clone()
+            seq_t = torch.LongTensor(item_seq).unsqueeze(0)
+            exp_t = torch.FloatTensor(item_exposure)
+            logits, _, _, _ = self.forward(seq_t, exp_t)
+            logits = logits.clone()
             if exclude_items and len(exclude_items) > 0:
                 logits[0, exclude_items] = -1e9
-            return logits.argmax(dim=-1).item()
+            action = logits.argmax(dim=-1).item()
+        if training:
+            self.train()
+        return action
 
-    def explain(self, state: np.ndarray, action: int,
+    def explain(self, item_seq: np.ndarray,
+                item_exposure: np.ndarray,
+                action: int,
+                exclude_items: list = None,
                 top_k: int = 5) -> dict:
         """
-        Counterfactual explanation for a recommendation.
-
-        Answers: 'Why item X and not item Y?'
-
-        Returns
-        -------
-        dict with:
-          chosen_item       : int
-          chosen_prob       : float
-          top_alternatives  : list[int]   — next best items
-          alt_probs         : list[float]
-          feature_importance: list[float] — which state dims drove the choice
-          state_value       : float       — how good this state was rated
+        Full explanation combining attention, saliency, counterfactual.
         """
-        # Single forward pass — compute everything from one graph
-        state_t = torch.FloatTensor(state).unsqueeze(0).requires_grad_(True)
-        logits, value = self.forward(state_t)
-        probs_t       = F.softmax(logits, dim=-1)              # (1, n_items)
+        seq_t = torch.LongTensor(item_seq).unsqueeze(0)
+        exp_t = torch.FloatTensor(item_exposure)
 
-        probs_np  = probs_t.detach().numpy()[0]
-        top_items = np.argsort(probs_np)[::-1][:top_k]
+        # Grad w.r.t. embeddings for saliency
+        emb_t        = self.item_emb(seq_t).detach().requires_grad_(True)
+        gru_state    = self.encoder(emb_t)
+        features     = self.trunk(gru_state)
+        logits       = self.actor(features)
+        fair_logits  = self.fairness_layer(logits, features, exp_t)
+        attn_weights = self.attention(gru_state, emb_t)
 
-        # Gradient of chosen item's logit w.r.t. state — feature importance
-        # Zero any existing grads first
-        if state_t.grad is not None:
-            state_t.grad.zero_()
+        fair_logits_masked = fair_logits.clone()
+        if exclude_items and len(exclude_items) > 0:
+            fair_logits_masked[0, exclude_items] = -1e9
 
-        logits[0, action].backward(retain_graph=False)
-        importance = state_t.grad.abs().squeeze().detach().numpy()
+        probs_np = F.softmax(fair_logits_masked.detach(), dim=-1).numpy()[0]
+
+        # 1. Attention
+        history_ids = item_seq.tolist()
+        attn_exp    = self.attention.explain(
+            gru_state.detach(), emb_t.detach(), history_ids)
+
+        # 2. Gradient saliency
+        if emb_t.grad is not None:
+            emb_t.grad.zero_()
+        fair_logits_masked[0, action].backward()
+        saliency = emb_t.grad.abs().mean(dim=-1).squeeze().detach().numpy()
+
+        # 3. Counterfactual
+        probs_cf         = probs_np.copy()
+        probs_cf[action] = 0.0
+        top_alt          = np.argsort(probs_cf)[::-1][:top_k]
 
         return {
-            'chosen_item':        action,
-            'chosen_prob':        float(probs_np[action]),
-            'top_alternatives':   top_items.tolist(),
-            'alt_probs':          probs_np[top_items].tolist(),
-            'feature_importance': importance.tolist(),
-            'state_value':        float(value.detach().item()),
+            'chosen_item': action,
+            'chosen_prob': float(probs_np[action]),
+            'attention': {
+                'weights':           attn_exp['attention_weights'],
+                'top_history_items': attn_exp['top_history_items'],
+                'top_weights':       attn_exp['top_history_weights'],
+                'explanation':       attn_exp['explanation'],
+            },
+            'saliency': {
+                'scores':             saliency.tolist(),
+                'most_important_pos': int(np.argmax(saliency)),
+                'explanation': (
+                    f"Position {int(np.argmax(saliency))} in history "
+                    f"(0=oldest, {len(item_seq)-1}=most recent) "
+                    f"had the most influence"
+                )
+            },
+            'counterfactual': {
+                'alternatives': top_alt.tolist(),
+                'alt_probs':    probs_np[top_alt].tolist(),
+                'explanation': (
+                    f"If item {action} was not available, "
+                    f"item {top_alt[0]} would have been recommended"
+                )
+            }
         }
