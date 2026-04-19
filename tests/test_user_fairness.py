@@ -96,7 +96,10 @@ with torch.no_grad():
                 item_seq, env.item_exposure,
                 exclude_items=env.get_excluded_items())
             topk.append(action)
-            env._session_history.append(action)
+            # env._session_history.append(action)
+            _, _, done, _ = env.step(action)
+            if done:
+                break
         recs[str(uid)] = topk
 
 # ── Compute DP and EO ─────────────────────────────────────────────────
