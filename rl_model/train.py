@@ -20,7 +20,7 @@ CFG = {
     'lr':                   3e-4,
     'gamma':                0.99,
     'fairness_lambda':      0.1,
-    'n_episodes':           10000,
+    'n_episodes':           50000,
     'max_steps':            20,
     'log_every':            1000,
     'save_every':           5000,

@@ -61,7 +61,7 @@ class FairnessConstraintLayer(nn.Module):
                 item_exposure: torch.Tensor) -> torch.Tensor:
         exp_norm = torch.log1p(item_exposure)
         exp_norm = exp_norm / (exp_norm.max() + 1e-9)
-        alpha = torch.softplus(self.alpha)
+        alpha = F.softplus(self.alpha)
         fairness_penalty = exp_norm * alpha
         user_sensitivity = torch.sigmoid(self.user_proj(state))
         adjusted_logits = logits - user_sensitivity * fairness_penalty.unsqueeze(0)

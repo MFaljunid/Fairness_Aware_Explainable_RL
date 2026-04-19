@@ -177,14 +177,14 @@ class RecEnv:
         return r_rel - self.fairness_lambda * r_fair
 
     def _relevance_reward(self, item: int) -> float:
-        """
-        +1 if item is in user's ground-truth training interactions.
-         0 otherwise.
+        if item in self._gt_set[self.current_user]:
+            return 1.0
 
-        Binary and unambiguous — no similarity heuristics.
-        Cold-start users (not in _gt_set) safely return 0.
-        """
-        return 1.0 if item in self._gt_set[self.current_user] else 0.0
+        state = self._get_state()
+        state_vec = state.mean(axis=0)
+
+        sim = float(np.dot(state_vec, self.item_embeddings[item]))
+        return max(0.0, sim)
 
     def _fairness_penalty(self, item: int) -> float:
         """
