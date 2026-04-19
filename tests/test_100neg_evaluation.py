@@ -133,7 +133,7 @@ with torch.no_grad():
         # Get model scores for all 100 candidates
         item_seq  = get_item_seq(uid)
         seq_t     = torch.LongTensor(item_seq).unsqueeze(0)
-        exp_t     = torch.FloatTensor(env.item_exposure)
+        exp_t = torch.zeros(N_ITEMS)
 
         logits, _, _, _ = policy.forward(seq_t, exp_t)
         logits_np       = logits.squeeze(0).numpy()
