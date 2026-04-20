@@ -14,19 +14,34 @@ from rl_model.policy import ActorCriticPolicy
 
 os.makedirs('results', exist_ok=True)
 
+# CFG = {
+#     'emb_dim':              64,
+#     'hidden_dim':           256,
+#     'lr':                   3e-4,
+#     'gamma':                0.99,
+#     'fairness_lambda':      0.1,
+#     'n_episodes':           50000,
+#     'max_steps':            20,
+#     'log_every':            1000,
+#     'save_every':           5000,
+#     'window':               10,
+#     'entropy_coef':         0.01,
+#     'warmup_episodes':      10000,  # Fix 3: no fairness penalty for first 10k episodes
+# }
+
 CFG = {
-    'emb_dim':              64,
-    'hidden_dim':           256,
-    'lr':                   3e-4,
-    'gamma':                0.99,
-    'fairness_lambda':      0.1,
-    'n_episodes':           50000,
-    'max_steps':            20,
-    'log_every':            1000,
-    'save_every':           5000,
-    'window':               10,
-    'entropy_coef':         0.01,
-    'warmup_episodes':      10000,  # Fix 3: no fairness penalty for first 10k episodes
+    'emb_dim':         64,
+    'hidden_dim':      256,
+    'lr':              1e-4,       # lower — fine-tuning
+    'gamma':           0.99,
+    'fairness_lambda': 0.1,
+    'n_episodes':      20000,      # less needed
+    'max_steps':       20,
+    'log_every':       1000,
+    'save_every':      5000,
+    'window':          10,
+    'entropy_coef':    0.005,      # less entropy
+    'warmup_episodes': 0,          # no warmup — start fairness immediately
 }
 
 # ── Environment ───────────────────────────────────────────────────────
@@ -64,6 +79,16 @@ if os.path.exists(emb_path):
     print("Initialized policy embeddings from BPR")
 else:
     print("WARNING: BPR embeddings not found — using random embeddings")
+
+# Load pretrained model for RL fine-tuning
+pretrain_path = 'results/policy_pretrained.pt'
+if os.path.exists(pretrain_path):
+    policy.load_state_dict(
+        torch.load(pretrain_path, map_location='cpu'))
+    print("Loaded pretrained model for RL fine-tuning")
+else:
+    print("WARNING: No pretrained model found — training from scratch")
+# ── END ADD ───────────────────────────────────────────────────────────
 
 optimizer = optim.Adam(policy.parameters(), lr=CFG['lr'])
 
