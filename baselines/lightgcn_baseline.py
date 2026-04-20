@@ -30,7 +30,7 @@ eval_method = RatioSplit(
 
 # ── Model ─────────────────────────────────────────────────────────────
 lightgcn = LightGCN(
-    num_epochs=1000,
+    num_epochs=100,
     learning_rate=0.001,
     emb_size=64,       # same as BPR for fair comparison
     num_layers=3,
