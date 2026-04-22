@@ -12,8 +12,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))) 
 os.makedirs('results', exist_ok=True)
 
 # ── Load data ─────────────────────────────────────────────────────────
-train = pd.read_csv('data/train.csv')
-meta  = json.load(open('data/meta.json'))
+train = pd.read_csv('data/ml-1m/train.csv')
+meta  = json.load(open('data/ml-1m/meta.json'))
 
 data = list(zip(
     train['user_id'].astype(str),

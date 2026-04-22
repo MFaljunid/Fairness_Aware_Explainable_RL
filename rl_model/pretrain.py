@@ -15,27 +15,43 @@ print("=" * 50)
 print("Phase 1: Supervised Pre-training")
 print("=" * 50)
 
+# ── Config ─────────────────────────────────────────────────────────────
+DATA_DIR = 'data/ml-1m'   # ← all data here
+
 CFG = {
-    'emb_dim':    64,
-    'hidden_dim': 256,
-    'window':     10,
-    'lr':         1e-3,
-    'epochs':     50,
-    'batch_size': 512,
-    'neg_samples': 4,   # negative samples per positive
+    'emb_dim':     64,
+    'hidden_dim':  256,
+    'window':      10,
+    'lr':          1e-3,
+    'epochs':      50,
+    'batch_size':  512,
+    'neg_samples': 4,
 }
 
 # ── Load data ──────────────────────────────────────────────────────────
-train = pd.read_csv('data/train.csv')
-meta  = json.load(open('data/meta.json'))
+train  = pd.read_csv(f'{DATA_DIR}/train.csv')
+meta   = json.load(open(f'{DATA_DIR}/meta.json'))
 N_USERS = meta['n_users']
 N_ITEMS = meta['n_items']
 
 # ── Environment ────────────────────────────────────────────────────────
-env = RecEnv('data/train.csv', 'data/meta.json',
-             emb_dim=CFG['emb_dim'], window=CFG['window'])
+env = RecEnv(
+    train_path=f'{DATA_DIR}/train.csv',
+    meta_path=f'{DATA_DIR}/meta.json',
+    emb_dim=CFG['emb_dim'],
+    window=CFG['window']
+)
 
-bpr_embeddings = np.load('data/bpr_item_embeddings.npy')
+bpr_embeddings = np.load(f'{DATA_DIR}/bpr_item_embeddings.npy')
+
+# Pad embeddings if Cornac dropped some items
+if bpr_embeddings.shape[0] < N_ITEMS:
+    print(f"Padding embeddings from {bpr_embeddings.shape[0]} to {N_ITEMS}")
+    pad = np.zeros((N_ITEMS - bpr_embeddings.shape[0],
+                    bpr_embeddings.shape[1]), dtype=np.float32)
+    bpr_embeddings = np.vstack([bpr_embeddings, pad])
+    print(f"Embeddings padded to {bpr_embeddings.shape}")
+
 env.load_pretrained_embeddings(bpr_embeddings)
 
 # ── Policy ─────────────────────────────────────────────────────────────
@@ -45,7 +61,7 @@ policy = ActorCriticPolicy(
     hidden_dim=CFG['hidden_dim']
 )
 
-# Initialize from BPR
+# Initialize from BPR embeddings
 with torch.no_grad():
     bpr_t    = torch.FloatTensor(bpr_embeddings)
     norms    = bpr_t.norm(dim=1, keepdim=True) + 1e-9
@@ -60,30 +76,28 @@ user_items = defaultdict(list)
 for _, row in train.iterrows():
     user_items[int(row['user_id'])].append(int(row['item_id']))
 
-all_items = list(range(N_ITEMS))
-
 def get_item_seq(user_id):
     history = env._gt_history[user_id]
     recent  = history[-CFG['window']:]
     if len(recent) < CFG['window']:
-        pad = [0] * (CFG['window'] - len(recent))
+        pad    = [0] * (CFG['window'] - len(recent))
         recent = pad + recent
     return np.array(recent, dtype=np.int64)
 
 # ── BPR Loss ───────────────────────────────────────────────────────────
 def bpr_loss(pos_scores, neg_scores):
-    """
-    BPR pairwise ranking loss.
-    pos_scores should be higher than neg_scores.
-    """
-    return -torch.log(torch.sigmoid(pos_scores - neg_scores) + 1e-9).mean()
+    return -torch.log(
+        torch.sigmoid(pos_scores - neg_scores) + 1e-9).mean()
 
 # ── Pre-training loop ──────────────────────────────────────────────────
 print(f"Training on {len(train)} interactions")
 print(f"Epochs: {CFG['epochs']}  |  Batch size: {CFG['batch_size']}")
+print(f"Users: {N_USERS}  |  Items: {N_ITEMS}")
 
-# Build all positive (user, item) pairs
-pos_pairs = list(zip(train['user_id'].astype(int), train['item_id'].astype(int)))
+pos_pairs = list(zip(
+    train['user_id'].astype(int),
+    train['item_id'].astype(int)
+))
 
 for epoch in range(CFG['epochs']):
     np.random.shuffle(pos_pairs)
@@ -95,34 +109,30 @@ for epoch in range(CFG['epochs']):
         if len(batch) < 2:
             continue
 
-        # Build tensors
-        user_seqs  = []
-        pos_items  = []
-        neg_items  = []
+        user_seqs = []
+        pos_items = []
+        neg_items = []
 
         for uid, pos_item in batch:
             seq = get_item_seq(uid)
             user_seqs.append(seq)
             pos_items.append(pos_item)
 
-            # Sample negative item not in user history
             seen = set(user_items[uid])
             neg  = np.random.randint(0, N_ITEMS)
             while neg in seen:
                 neg = np.random.randint(0, N_ITEMS)
             neg_items.append(neg)
 
-        seq_t   = torch.LongTensor(np.array(user_seqs))   # (B, window)
-        exp_t   = torch.zeros(N_ITEMS)                    # zero exposure during pretraining
-        pos_t   = torch.LongTensor(pos_items)
-        neg_t   = torch.LongTensor(neg_items)
+        seq_t = torch.LongTensor(np.array(user_seqs))
+        exp_t = torch.zeros(N_ITEMS)
+        pos_t = torch.LongTensor(pos_items)
+        neg_t = torch.LongTensor(neg_items)
 
-        # Forward pass
-        logits, _, _, _ = policy.forward(seq_t, exp_t)   # (B, N_ITEMS)
+        logits, _, _, _ = policy.forward(seq_t, exp_t)
 
-        # Get scores for positive and negative items
-        pos_scores = logits.gather(1, pos_t.unsqueeze(1)).squeeze(1)  # (B,)
-        neg_scores = logits.gather(1, neg_t.unsqueeze(1)).squeeze(1)  # (B,)
+        pos_scores = logits.gather(1, pos_t.unsqueeze(1)).squeeze(1)
+        neg_scores = logits.gather(1, neg_t.unsqueeze(1)).squeeze(1)
 
         loss = bpr_loss(pos_scores, neg_scores)
 
@@ -139,31 +149,44 @@ for epoch in range(CFG['epochs']):
         print(f"Epoch {epoch+1:>3}/{CFG['epochs']} | Loss: {avg_loss:.4f}")
 
 # ── Save pretrained model ──────────────────────────────────────────────
+os.makedirs('results', exist_ok=True)
 torch.save(policy.state_dict(), 'results/policy_pretrained.pt')
 print(f"\nPre-trained model saved to results/policy_pretrained.pt")
 
 # ── Quick evaluation ───────────────────────────────────────────────────
 print("\nQuick 100-neg evaluation after pre-training...")
 
-test_df    = pd.read_csv('data/test.csv')
-test_items_dict = dict(zip(test_df['user_id'].astype(int),
-                           test_df['item_id'].astype(int)))
-policy.eval()
+test_df  = pd.read_csv(f'{DATA_DIR}/test.csv')
 
+# Build test set — multiple items per user (80/20 split)
+test_set = defaultdict(set)
+for _, row in test_df.iterrows():
+    test_set[int(row['user_id'])].add(int(row['item_id']))
+
+policy.eval()
 hits = []
 np.random.seed(42)
 
+sample_users = list(test_set.keys())[:1000]
+
 with torch.no_grad():
-    for uid, pos_item in list(test_items_dict.items())[:1000]:
-        seen       = set(user_items[uid]) | {pos_item}
-        pool       = [i for i in range(N_ITEMS) if i not in seen]
+    for uid in sample_users:
+        relevant = test_set[uid]
+        seen     = set(user_items[uid]) | relevant
+        pool     = [i for i in range(N_ITEMS) if i not in seen]
+
+        if len(pool) < 99:
+            continue
+
         neg_items  = np.random.choice(pool, size=99, replace=False).tolist()
+        # Use first test item as positive for 100-neg eval
+        pos_item   = list(relevant)[0]
         candidates = [pos_item] + neg_items
 
-        seq_t      = torch.LongTensor(get_item_seq(uid)).unsqueeze(0)
-        exp_t      = torch.zeros(N_ITEMS)
+        seq_t           = torch.LongTensor(get_item_seq(uid)).unsqueeze(0)
+        exp_t           = torch.zeros(N_ITEMS)
         logits, _, _, _ = policy.forward(seq_t, exp_t)
-        scores     = logits.squeeze(0).numpy()
+        scores          = logits.squeeze(0).numpy()
 
         ranked = sorted(candidates, key=lambda x: scores[x], reverse=True)
         hits.append(1.0 if pos_item in ranked[:10] else 0.0)

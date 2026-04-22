@@ -46,8 +46,8 @@ CFG = {
 
 # ── Environment ───────────────────────────────────────────────────────
 env = RecEnv(
-    train_path='data/train.csv',
-    meta_path='data/meta.json',
+    train_path='data/ml-1m/train.csv',
+    meta_path='data/ml-1m/meta.json',
     emb_dim=CFG['emb_dim'],
     window=CFG['window'],
     fairness_lambda=CFG['fairness_lambda']
@@ -60,12 +60,14 @@ policy = ActorCriticPolicy(
     hidden_dim=CFG['hidden_dim']
 )
 
-# Load BPR embeddings into BOTH environment AND policy
-emb_path = 'data/bpr_item_embeddings.npy'
+emb_path = 'data/ml-1m/bpr_item_embeddings.npy'
 if os.path.exists(emb_path):
     bpr_embeddings = np.load(emb_path)
-
-    # Load into environment (for reward signal)
+    if bpr_embeddings.shape[0] < env.n_items:
+        pad = np.zeros((env.n_items - bpr_embeddings.shape[0],
+                        bpr_embeddings.shape[1]), dtype=np.float32)
+        bpr_embeddings = np.vstack([bpr_embeddings, pad])
+        print(f"Embeddings padded to {bpr_embeddings.shape}")
     env.load_pretrained_embeddings(bpr_embeddings)
     print(f"Loaded BPR embeddings into environment: {bpr_embeddings.shape}")
 
@@ -195,7 +197,7 @@ from metrics.fairness_metrics import compute_all
 import pandas as pd
 
 print("\nEvaluating on test users...")
-test   = pd.read_csv('data/test.csv')
+test   = pd.read_csv('data/ml-1m/test.csv')
 policy.eval()
 recs   = {}
 
@@ -217,7 +219,7 @@ with torch.no_grad():
 policy.train()
 
 item_pop = np.bincount(
-    pd.read_csv('data/train.csv')['item_id'].values,
+    pd.read_csv('data/ml-1m/train.csv')['item_id'].values,
     minlength=env.n_items
 ).astype(float)
 
@@ -243,7 +245,7 @@ def recall_at_k(recommended, relevant, k):
 def precision_at_k(recommended, relevant, k):
     return len(set(recommended[:k]) & set(relevant)) / k
 
-test_df     = pd.read_csv('data/test.csv')
+test_df     = pd.read_csv('data/ml-1m/test.csv')
 user_groups = test_df.groupby('user_id')['item_id'].apply(list)
 
 ndcg10, ndcg20, recall10, recall20, precision10 = [], [], [], [], []

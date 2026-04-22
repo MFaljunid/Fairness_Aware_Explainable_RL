@@ -12,10 +12,10 @@ from metrics.user_fairness_metrics import load_user_gender, compute_dp_eo
 
 print("LightGCN 100-neg evaluation (correct mapping)...")
 
-train  = pd.read_csv('data/train.csv')
-val    = pd.read_csv('data/val.csv')
-test   = pd.read_csv('data/test.csv')
-meta   = json.load(open('data/meta.json'))
+train  = pd.read_csv('data/ml-1m/train.csv')
+val    = pd.read_csv('data/ml-1m/val.csv')
+test   = pd.read_csv('data/ml-1m/test.csv')
+meta   = json.load(open('data/ml-1m/meta.json'))
 
 N_ITEMS = meta['n_items']
 K_LIST  = [5, 10, 20, 30, 40]
