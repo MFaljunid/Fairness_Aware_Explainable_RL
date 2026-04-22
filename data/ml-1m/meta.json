@@ -9577,5 +9577,6 @@
     "3952": 3532
   },
   "split": "80/20 random \u2014 same as FairIR paper",
-  "filter": "rating > 3"
+  "filter": "rating > 3",
+  "users_dat": "data\\ml-1m\\users.dat"
 }
