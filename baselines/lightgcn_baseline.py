@@ -5,6 +5,9 @@ from cornac.eval_methods import RatioSplit
 from cornac.models import LightGCN
 from cornac.metrics import NDCG, Recall, Precision
 import json, os
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))  # ← add this
 
 os.makedirs('results', exist_ok=True)
 

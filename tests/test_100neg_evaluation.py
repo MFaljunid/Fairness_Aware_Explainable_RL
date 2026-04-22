@@ -8,43 +8,44 @@ import json
 from collections import defaultdict
 from rl_model.environment import RecEnv
 from rl_model.policy import ActorCriticPolicy
+from metrics.fairness_metrics import compute_exposure, gini_coefficient, coverage
+from metrics.user_fairness_metrics import load_user_gender, compute_dp_eo
 
-print("=" * 55)
-print("100-Negative Sampling Evaluation")
-print("Same protocol as most CF papers")
-print("=" * 55)
+print("=" * 60)
+print("RL Model — Full Evaluation at K = 5, 10, 20, 30, 40")
+print("=" * 60)
 
-# ── Config ─────────────────────────────────────────────────────────────
 CFG = {
-    'emb_dim':    64,
-    'hidden_dim': 256,
-    'window':     10,
+    'emb_dim':         64,
+    'hidden_dim':      256,
+    'window':          10,
     'fairness_lambda': 0.1,
-    'n_negatives': 99,    # 99 negatives + 1 positive = 100 candidates
-    'k_list':     [5, 10, 20],
+    'n_negatives':     99,
+    'k_list':          [5, 10, 20, 30, 40],   # ← all K values
 }
 
 # ── Load data ──────────────────────────────────────────────────────────
 train  = pd.read_csv('data/train.csv')
+val    = pd.read_csv('data/val.csv')
 test   = pd.read_csv('data/test.csv')
 meta   = json.load(open('data/meta.json'))
 
 N_USERS = meta['n_users']
 N_ITEMS = meta['n_items']
 
-# ── Build interaction sets ─────────────────────────────────────────────
-# Used to sample TRUE negatives — items user has never interacted with
 train_set = defaultdict(set)
 for _, row in train.iterrows():
     train_set[int(row['user_id'])].add(int(row['item_id']))
+
+val_set = defaultdict(set)
+for _, row in val.iterrows():
+    val_set[int(row['user_id'])].add(int(row['item_id']))
 
 test_items = {}
 for _, row in test.iterrows():
     test_items[int(row['user_id'])] = int(row['item_id'])
 
-print(f"\nUsers: {N_USERS}  |  Items: {N_ITEMS}")
-print(f"Candidates per user: {CFG['n_negatives'] + 1} "
-      f"(1 positive + {CFG['n_negatives']} negatives)")
+print(f"Users: {N_USERS}  |  Items: {N_ITEMS}")
 
 # ── Load environment and policy ────────────────────────────────────────
 env = RecEnv(
@@ -55,30 +56,29 @@ env = RecEnv(
     fairness_lambda=CFG['fairness_lambda']
 )
 
-# Load BPR embeddings if available
 emb_path = 'data/bpr_item_embeddings.npy'
 if os.path.exists(emb_path):
     env.load_pretrained_embeddings(np.load(emb_path))
     print("Loaded BPR embeddings")
-else:
-    print("WARNING: using random embeddings")
 
 policy = ActorCriticPolicy(
     emb_dim=CFG['emb_dim'],
     n_items=N_ITEMS,
     hidden_dim=CFG['hidden_dim']
 )
-
-# Load trained model
-model_path = 'results/policy_final.pt'
-assert os.path.exists(model_path), \
-    f"No trained model found at {model_path} — run train.py first"
-policy.load_state_dict(torch.load(model_path, map_location='cpu'))
+policy.load_state_dict(
+    torch.load('results/policy_final.pt', map_location='cpu'))
 policy.eval()
-print(f"Loaded model from {model_path}")
+print("Loaded model: results/policy_final.pt")
 
-# ── Helper ─────────────────────────────────────────────────────────────
-def get_item_seq(user_id: int) -> np.ndarray:
+# ── Gender for DP/EO ───────────────────────────────────────────────────
+user2idx    = {int(k): int(v) for k, v in meta['user2idx'].items()}
+raw_gender  = load_user_gender('data/users.dat')
+user_gender = {user2idx[u]: g for u, g in raw_gender.items()
+               if u in user2idx}
+
+# ── Helpers ────────────────────────────────────────────────────────────
+def get_item_seq(user_id):
     history = env._gt_history[user_id]
     recent  = history[-CFG['window']:]
     if len(recent) < CFG['window']:
@@ -86,105 +86,88 @@ def get_item_seq(user_id: int) -> np.ndarray:
         recent = pad + recent
     return np.array(recent, dtype=np.int64)
 
-# ── Metric functions ───────────────────────────────────────────────────
-def hit_at_k(ranked_items, positive_item, k):
-    """1 if positive item is in top-k, else 0."""
-    return 1.0 if positive_item in ranked_items[:k] else 0.0
+def hit_at_k(ranked, pos, k):
+    return 1.0 if pos in ranked[:k] else 0.0
 
-def ndcg_at_k(ranked_items, positive_item, k):
-    """NDCG with single positive item."""
-    if positive_item in ranked_items[:k]:
-        rank = ranked_items[:k].index(positive_item)
-        return 1.0 / np.log2(rank + 2)
+def ndcg_at_k(ranked, pos, k):
+    if pos in ranked[:k]:
+        return 1.0 / np.log2(ranked[:k].index(pos) + 2)
     return 0.0
 
-def mrr(ranked_items, positive_item):
-    """Mean Reciprocal Rank."""
-    if positive_item in ranked_items:
-        rank = ranked_items.index(positive_item)
-        return 1.0 / (rank + 1)
+def mrr_score(ranked, pos):
+    if pos in ranked:
+        return 1.0 / (ranked.index(pos) + 1)
     return 0.0
 
-# ── 100-Negative Sampling Evaluation ──────────────────────────────────
+# ── Evaluation loop ────────────────────────────────────────────────────
 print("\nRunning evaluation...")
+np.random.seed(42)
 
-results_per_k = {k: {'hit': [], 'ndcg': []} for k in CFG['k_list']}
-mrr_scores    = []
-np.random.seed(42)   # reproducible negative sampling
+results   = {k: {'hits': [], 'ndcgs': []} for k in CFG['k_list']}
+mrr_list  = []
+recs_dict = {}
 
 with torch.no_grad():
     for uid, pos_item in test_items.items():
+        seen       = train_set[uid] | val_set[uid] | {pos_item}
+        pool       = list(set(range(N_ITEMS)) - seen)
 
-        # Sample 99 true negatives — items this user never interacted with
-        all_items       = set(range(N_ITEMS))
-        seen_items      = train_set[uid] | {pos_item}
-        candidate_pool  = list(all_items - seen_items)
+        if len(pool) < 99:
+            continue
 
-        # Sample exactly n_negatives
-        neg_items = np.random.choice(
-            candidate_pool,
-            size=min(CFG['n_negatives'], len(candidate_pool)),
-            replace=False
-        ).tolist()
+        neg_items  = np.random.choice(pool, size=99, replace=False).tolist()
+        candidates = [pos_item] + neg_items
 
-        # Candidate set: 1 positive + 99 negatives
-        candidates = [pos_item] + neg_items   # length = 100
+        item_seq         = get_item_seq(uid)
+        seq_t            = torch.LongTensor(item_seq).unsqueeze(0)
+        exp_t            = torch.zeros(N_ITEMS)
+        logits, _, _, _  = policy.forward(seq_t, exp_t)
+        logits_np        = logits.squeeze(0).numpy()
 
-        # Get model scores for all 100 candidates
-        item_seq  = get_item_seq(uid)
-        seq_t     = torch.LongTensor(item_seq).unsqueeze(0)
-        exp_t = torch.zeros(N_ITEMS)
+        ranked = sorted(candidates,
+                        key=lambda x: logits_np[x], reverse=True)
 
-        logits, _, _, _ = policy.forward(seq_t, exp_t)
-        logits_np       = logits.squeeze(0).numpy()
-
-        # Score only the 100 candidates
-        candidate_scores = [(item, logits_np[item]) for item in candidates]
-
-        # Rank by score descending
-        ranked = [item for item, score in
-                  sorted(candidate_scores, key=lambda x: x[1], reverse=True)]
-
-        # Compute metrics
-        mrr_scores.append(mrr(ranked, pos_item))
+        recs_dict[str(uid)] = ranked
+        mrr_list.append(mrr_score(ranked, pos_item))
 
         for k in CFG['k_list']:
-            results_per_k[k]['hit'].append( hit_at_k(ranked, pos_item, k))
-            results_per_k[k]['ndcg'].append(ndcg_at_k(ranked, pos_item, k))
+            results[k]['hits'].append(hit_at_k(ranked, pos_item, k))
+            results[k]['ndcgs'].append(ndcg_at_k(ranked, pos_item, k))
 
-# ── Print results ──────────────────────────────────────────────────────
-print("\n" + "=" * 55)
-print(f"{'Metric':<20} {'Value':>10}")
-print("-" * 35)
-
-for k in CFG['k_list']:
-    hr   = np.mean(results_per_k[k]['hit'])
-    ndcg = np.mean(results_per_k[k]['ndcg'])
-    print(f"Hit Rate@{k:<11} {hr:>10.4f}")
-    print(f"NDCG@{k:<15}    {ndcg:>10.4f}")
-    print("-" * 35)
-
-print(f"{'MRR':<20} {np.mean(mrr_scores):>10.4f}")
+# ── Print results table ────────────────────────────────────────────────
+print(f"\n{'K':<5} {'HR':>7} {'NDCG':>7} {'DP':>7} {'EO':>7} "
+      f"{'Gini':>7} {'Cov':>7}")
 print("=" * 55)
 
-# ── Compare with BPR if available ─────────────────────────────────────
-print("\nContext — typical 100-neg results on MovieLens-1M:")
-print("  BPR       NDCG@10 ~ 0.45–0.65")
-print("  LightGCN  NDCG@10 ~ 0.55–0.75")
-print("  Your RL   NDCG@10 = see above")
-
-# ── Save results ───────────────────────────────────────────────────────
-save_results = {
-    'protocol':   '100-negative-sampling',
-    'n_users':    N_USERS,
-    'n_negatives': CFG['n_negatives'],
-}
+rl_results = {}
 for k in CFG['k_list']:
-    save_results[f'HR@{k}']   = round(float(np.mean(results_per_k[k]['hit'])),  4)
-    save_results[f'NDCG@{k}'] = round(float(np.mean(results_per_k[k]['ndcg'])), 4)
-save_results['MRR'] = round(float(np.mean(mrr_scores)), 4)
+    hr   = np.mean(results[k]['hits'])
+    ndcg = np.mean(results[k]['ndcgs'])
 
-with open('results/rl_100neg_evaluation.json', 'w') as f:
-    json.dump(save_results, f, indent=2)
+    recs_k   = {uid: items[:k] for uid, items in recs_dict.items()}
+    exposure = compute_exposure(recs_k, N_ITEMS, k)
+    gini     = gini_coefficient(exposure)
+    cov      = coverage(recs_k, N_ITEMS, k)
+    fairness = compute_dp_eo(recs_k, user_gender, test_items, k)
 
-print(f"\nResults saved to results/rl_100neg_evaluation.json")
+    rl_results[k] = {
+        'HR':       round(hr,   4),
+        'NDCG':     round(ndcg, 4),
+        'DP':       round(fairness['DP'], 4),
+        'EO':       round(fairness['EO'], 4),
+        'Gini':     round(gini, 4),
+        'Coverage': round(cov,  4),
+    }
+    r = rl_results[k]
+    print(f"K={k:<3} {r['HR']:>7.4f} {r['NDCG']:>7.4f} "
+          f"{r['DP']:>7.4f} {r['EO']:>7.4f} "
+          f"{r['Gini']:>7.4f} {r['Coverage']:>7.4f}")
+
+print(f"\nMRR: {np.mean(mrr_list):.4f}")
+print("=" * 55)
+
+# ── Save ───────────────────────────────────────────────────────────────
+with open('results/rl_full_evaluation.json', 'w') as f:
+    json.dump({str(k): v for k, v in rl_results.items()}, f, indent=2)
+
+print("\nSaved: results/rl_full_evaluation.json")
