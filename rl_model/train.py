@@ -32,16 +32,16 @@ os.makedirs('results', exist_ok=True)
 CFG = {
     'emb_dim':         64,
     'hidden_dim':      256,
-    'lr':              1e-4,       # lower — fine-tuning
+    'lr':              1e-4,
     'gamma':           0.99,
-    'fairness_lambda': 0.1,
-    'n_episodes':      20000,      # less needed
+    'fairness_lambda': 0.2,
+    'n_episodes':      25000,
     'max_steps':       20,
     'log_every':       1000,
     'save_every':      5000,
     'window':          10,
-    'entropy_coef':    0.005,      # less entropy
-    'warmup_episodes': 0,          # no warmup — start fairness immediately
+    'entropy_coef':    0.01,
+    'warmup_episodes': 5000,
 }
 
 # ── Environment ───────────────────────────────────────────────────────
@@ -50,7 +50,8 @@ env = RecEnv(
     meta_path='data/ml-1m/meta.json',
     emb_dim=CFG['emb_dim'],
     window=CFG['window'],
-    fairness_lambda=CFG['fairness_lambda']
+    fairness_lambda=CFG['fairness_lambda'],
+    users_dat_path='data/ml-1m/users.dat'    # ← add this
 )
 
 # ── Policy ────────────────────────────────────────────────────────────
