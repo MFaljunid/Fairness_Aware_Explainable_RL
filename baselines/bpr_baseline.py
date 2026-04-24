@@ -11,7 +11,6 @@ from cornac.metrics import NDCG, Recall, Precision
 import json, pickle
 from collections import defaultdict
 from metrics.fairness_metrics import compute_exposure, gini_coefficient, coverage
-from metrics.user_fairness_metrics import load_user_gender, compute_dp_eo
 
 os.makedirs('results', exist_ok=True)
 
@@ -102,6 +101,11 @@ test_set = defaultdict(set)
 for _, row in test_df.iterrows():
     test_set[int(row['user_id'])].add(int(row['item_id']))
 
+val_df  = pd.read_csv(f'{DATA_DIR}/val.csv')
+val_set = defaultdict(set)
+for _, row in val_df.iterrows():
+    val_set[int(row['user_id'])].add(int(row['item_id']))
+
 # Gender for DP/EO
 user2idx    = {int(k): int(v) for k, v in meta['user2idx'].items()}
 raw_gender  = load_user_gender(f'{DATA_DIR}/users.dat')
@@ -124,7 +128,7 @@ for uid in test_set.keys():
     except Exception:
         continue
 
-    seen = train_set[uid]
+    seen = train_set[uid] | val_set[uid]
     all_scores = []
     for item in range(N_ITEMS):
         if item in seen:
