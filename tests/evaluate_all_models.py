@@ -15,24 +15,26 @@ from rl_model.policy import ActorCriticPolicy
 from metrics.fairness_metrics import compute_exposure, gini_coefficient, coverage
 from metrics.user_fairness_metrics import load_user_gender, compute_dp_eo
 
-os.makedirs('results/figures', exist_ok=True)
+# ── Paths ──────────────────────────────────────────────────────────────
+DATA_DIR    = 'data/ml-1m'
+RESULTS_DIR = 'results/ml-1m'
+os.makedirs(f'{RESULTS_DIR}/figures', exist_ok=True)
 
 print("=" * 60)
 print("Evaluating ALL models at K = 5, 10, 20, 30, 40")
 print("=" * 60)
 
-# ── Config ─────────────────────────────────────────────────────────────
 K_LIST  = [5, 10, 20, 30, 40]
 N_NEG   = 99
-EMB_DIM = 64
-HIDDEN  = 256
+EMB_DIM = 128
+HIDDEN  = 512
 WINDOW  = 10
 
 # ── Load data ──────────────────────────────────────────────────────────
-train = pd.read_csv('data/train.csv')
-val   = pd.read_csv('data/val.csv')
-test  = pd.read_csv('data/test.csv')
-meta  = json.load(open('data/meta.json'))
+train = pd.read_csv(f'{DATA_DIR}/train.csv')
+val   = pd.read_csv(f'{DATA_DIR}/val.csv')
+test  = pd.read_csv(f'{DATA_DIR}/test.csv')
+meta  = json.load(open(f'{DATA_DIR}/meta.json'))
 
 N_USERS = meta['n_users']
 N_ITEMS = meta['n_items']
@@ -51,7 +53,7 @@ for _, row in test.iterrows():
 
 # ── Gender for DP/EO ───────────────────────────────────────────────────
 user2idx    = {int(k): int(v) for k, v in meta['user2idx'].items()}
-raw_gender  = load_user_gender('data/users.dat')
+raw_gender  = load_user_gender(f'{DATA_DIR}/users.dat')
 user_gender = {user2idx[u]: g for u, g in raw_gender.items()
                if u in user2idx}
 
@@ -200,15 +202,22 @@ else:
 # ══════════════════════════════════════════════════════════════════════
 print("\n--- Evaluating Your RL Model ---")
 
-env = RecEnv('data/train.csv', 'data/meta.json',
+env = RecEnv(f'{DATA_DIR}/train.csv', f'{DATA_DIR}/meta.json',
              emb_dim=EMB_DIM, window=WINDOW)
-if os.path.exists('data/bpr_item_embeddings.npy'):
-    env.load_pretrained_embeddings(np.load('data/bpr_item_embeddings.npy'))
+
+emb_path = f'{DATA_DIR}/bpr_item_embeddings.npy'
+if os.path.exists(emb_path):
+    bpr_emb = np.load(emb_path)
+    if bpr_emb.shape[0] < N_ITEMS:
+        pad     = np.zeros((N_ITEMS - bpr_emb.shape[0],
+                            bpr_emb.shape[1]), dtype=np.float32)
+        bpr_emb = np.vstack([bpr_emb, pad])
+    env.load_pretrained_embeddings(bpr_emb)
 
 policy = ActorCriticPolicy(emb_dim=EMB_DIM, n_items=N_ITEMS,
                             hidden_dim=HIDDEN)
 policy.load_state_dict(
-    torch.load('results/policy_final.pt', map_location='cpu'))
+    torch.load('results/ml-1m/policy_final.pt', map_location='cpu'))
 policy.eval()
 
 def get_item_seq(uid):
@@ -254,11 +263,11 @@ for k in K_LIST:
 ALL_RESULTS['Our RL'] = rl_final
 
 # ── Save all results ───────────────────────────────────────────────────
-with open('results/all_models_tradeoff.json', 'w') as f:
+with open(f'{RESULTS_DIR}/all_models_tradeoff.json', 'w') as f:
     json.dump({m: {str(k): v for k, v in res.items()}
                for m, res in ALL_RESULTS.items()},
               f, indent=2)
-print("\nSaved: results/all_models_tradeoff.json")
+print(f"\nSaved: {RESULTS_DIR}/all_models_tradeoff.json")
 
 # ══════════════════════════════════════════════════════════════════════
 # SUMMARY TABLE at K=10
@@ -276,11 +285,7 @@ for model, results in ALL_RESULTS.items():
           f"{r['Gini']:>7.4f} {r['Coverage']:>7.4f}")
 print("=" * 65)
 
-# ══════════════════════════════════════════════════════════════════════
-# FIGURE: Trade-off curves like FairIR Fig.4
-# ══════════════════════════════════════════════════════════════════════
-print("\nGenerating trade-off figures...")
-
+# ── Trade-off figure ───────────────────────────────────────────────────
 COLORS  = {'BPR': '#4C72B0', 'LightGCN': '#55A868', 'Our RL': '#E8A838'}
 MARKERS = {'BPR': 'o',       'LightGCN': 's',        'Our RL': '*'}
 SIZES   = {'BPR': 80,        'LightGCN': 80,          'Our RL': 200}
@@ -299,24 +304,16 @@ for ax, (xm, ym, xlabel, ylabel, title) in zip(axes, configs):
     for model, results in ALL_RESULTS.items():
         xs = [results[k][xm] for k in K_LIST]
         ys = [results[k][ym] for k in K_LIST]
-
-        ax.plot(xs, ys,
-                color=COLORS[model], linewidth=2,
-                alpha=0.8, zorder=3)
-        ax.scatter(xs, ys,
-                   color=COLORS[model],
-                   s=SIZES[model],
-                   marker=MARKERS[model],
-                   zorder=5, label=model,
-                   edgecolors='black', linewidth=0.5)
-
+        ax.plot(xs, ys, color=COLORS[model],
+                linewidth=2, alpha=0.8, zorder=3)
+        ax.scatter(xs, ys, color=COLORS[model],
+                   s=SIZES[model], marker=MARKERS[model],
+                   zorder=5, edgecolors='black', linewidth=0.5)
         for k, x, y in zip(K_LIST, xs, ys):
-            ax.annotate(f'K={k}',
-                        xy=(x, y),
+            ax.annotate(f'K={k}', xy=(x, y),
                         xytext=(6, 4),
                         textcoords='offset points',
-                        fontsize=8,
-                        color=COLORS[model],
+                        fontsize=8, color=COLORS[model],
                         fontweight='bold')
 
     ax.set_xlabel(xlabel, fontsize=11)
@@ -327,24 +324,19 @@ for ax, (xm, ym, xlabel, ylabel, title) in zip(axes, configs):
     ax.spines['right'].set_visible(False)
 
 handles = [
-    mlines.Line2D([], [],
-                  color=COLORS[m],
+    mlines.Line2D([], [], color=COLORS[m],
                   marker=MARKERS[m],
                   markersize=10 if m == 'Our RL' else 7,
-                  linewidth=2,
-                  label=m)
+                  linewidth=2, label=m)
     for m in ALL_RESULTS.keys()
 ]
-fig.legend(handles=handles,
-           loc='lower center',
-           ncol=3,
-           fontsize=11,
-           bbox_to_anchor=(0.5, -0.06),
-           frameon=True)
+fig.legend(handles=handles, loc='lower center',
+           ncol=3, fontsize=11,
+           bbox_to_anchor=(0.5, -0.06))
 
 plt.tight_layout()
-plt.savefig('results/figures/tradeoff_curves.png',
+plt.savefig(f'{RESULTS_DIR}/figures/tradeoff_curves.png',
             dpi=150, bbox_inches='tight')
 plt.close()
-print("Saved: results/figures/tradeoff_curves.png")
-print("\nDone. Check results/figures/ for the figure.")
+print(f"Saved: {RESULTS_DIR}/figures/tradeoff_curves.png")
+print("\nDone.")

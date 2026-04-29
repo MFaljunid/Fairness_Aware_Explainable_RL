@@ -14,34 +14,20 @@ from rl_model.policy import ActorCriticPolicy
 
 os.makedirs('results', exist_ok=True)
 
-# CFG = {
-#     'emb_dim':              64,
-#     'hidden_dim':           256,
-#     'lr':                   3e-4,
-#     'gamma':                0.99,
-#     'fairness_lambda':      0.1,
-#     'n_episodes':           50000,
-#     'max_steps':            20,
-#     'log_every':            1000,
-#     'save_every':           5000,
-#     'window':               10,
-#     'entropy_coef':         0.01,
-#     'warmup_episodes':      10000,  # Fix 3: no fairness penalty for first 10k episodes
-# }
 
 CFG = {
-    'emb_dim':         64,
-    'hidden_dim':      256,
+    'emb_dim':         128,
+    'hidden_dim':      512,
     'lr':              1e-4,
     'gamma':           0.99,
-    'fairness_lambda': 0.2,
-    'n_episodes':      25000,
+    'fairness_lambda': 0.1,
+    'n_episodes':      20000,
     'max_steps':       20,
     'log_every':       1000,
     'save_every':      5000,
     'window':          10,
-    'entropy_coef':    0.01,
-    'warmup_episodes': 5000,
+    'entropy_coef':    0.005,
+    'warmup_episodes': 0,
 }
 
 # ── Environment ───────────────────────────────────────────────────────
@@ -84,7 +70,7 @@ else:
     print("WARNING: BPR embeddings not found — using random embeddings")
 
 # Load pretrained model for RL fine-tuning
-pretrain_path = 'results/policy_pretrained.pt'
+pretrain_path = 'results/ml-1m/policy_pretrained.pt'
 if os.path.exists(pretrain_path):
     policy.load_state_dict(
         torch.load(pretrain_path, map_location='cpu'))
@@ -184,14 +170,14 @@ for episode in range(CFG['n_episodes']):
               f"Phase: {phase}")
 
     if (episode + 1) % CFG['save_every'] == 0:
-        path = f"results/policy_ep{episode+1}.pt"
+        path = f"results/ml-1m/policy_ep{episode+1}.pt"
         torch.save(policy.state_dict(), path)
         print(f"  Checkpoint saved: {path}")
 
 # ── Final save ────────────────────────────────────────────────────────
-torch.save(policy.state_dict(), 'results/policy_final.pt')
-np.save('results/episode_rewards.npy', np.array(episode_rewards))
-print("\nTraining complete.")
+torch.save(policy.state_dict(), 'results/ml-1m/policy_final.pt')
+np.save('results/ml-1m/episode_rewards.npy', np.array(episode_rewards))
+path = f"results/ml-1m/policy_ep{episode+1}.pt"
 
 # ── Evaluation ────────────────────────────────────────────────────────
 from metrics.fairness_metrics import compute_all

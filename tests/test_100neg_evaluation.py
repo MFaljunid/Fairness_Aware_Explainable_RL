@@ -1,5 +1,6 @@
 import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from metrics.user_fairness_metrics import load_user_gender, compute_dp_eo
 
 import numpy as np
 import torch
@@ -20,8 +21,8 @@ RESULTS_DIR = 'results/ml-1m'
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 CFG = {
-    'emb_dim':         64,
-    'hidden_dim':      256,
+    'emb_dim':         128,
+    'hidden_dim':      512,
     'window':          10,
     'fairness_lambda': 0.1,
     'n_negatives':     99,
@@ -44,6 +45,12 @@ for _, row in train.iterrows():
 test_set = defaultdict(set)
 for _, row in test.iterrows():
     test_set[int(row['user_id'])].add(int(row['item_id']))
+
+# Load val set for exclusion
+val_df  = pd.read_csv(f'{DATA_DIR}/val.csv')
+val_set = defaultdict(set)
+for _, row in val_df.iterrows():
+    val_set[int(row['user_id'])].add(int(row['item_id']))
 
 # Single test item per user for 100-neg eval
 test_items = {int(row['user_id']): int(row['item_id'])
@@ -77,7 +84,7 @@ policy = ActorCriticPolicy(
     hidden_dim=CFG['hidden_dim']
 )
 policy.load_state_dict(
-    torch.load('results/policy_final.pt', map_location='cpu'))
+    torch.load('results/ml-1m/policy_final.pt', map_location='cpu'))
 policy.eval()
 print("Loaded model: results/policy_final.pt")
 
@@ -119,7 +126,7 @@ recs_dict = {}
 
 with torch.no_grad():
     for uid, pos_item in test_items.items():
-        seen       = train_set[uid] | {pos_item}   # no val_set
+        seen = train_set[uid] | val_set[uid] | {pos_item}
         pool       = list(set(range(N_ITEMS)) - seen)
 
         if len(pool) < 99:
@@ -158,8 +165,8 @@ for k in CFG['k_list']:
     exposure = compute_exposure(recs_k, N_ITEMS, k)
     gini     = gini_coefficient(exposure)
     cov      = coverage(recs_k, N_ITEMS, k)
-    fairness = compute_fairir_dp_eo(recs_k, user_gender,
-                                     test_set, N_ITEMS, k)
+    fairness = compute_dp_eo(recs_k, user_gender, test_items, k)
+
 
     rl_results[k] = {
         'HR':       round(hr,   4),

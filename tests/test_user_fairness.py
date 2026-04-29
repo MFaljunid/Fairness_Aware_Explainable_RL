@@ -19,9 +19,9 @@ CFG = {'emb_dim': 64, 'hidden_dim': 256, 'window': 10,
        'fairness_lambda': 0.1}
 
 # ── Load data ──────────────────────────────────────────────────────────
-train  = pd.read_csv('data/train.csv')
-test   = pd.read_csv('data/test.csv')
-meta   = json.load(open('data/meta.json'))
+train  = pd.read_csv('data/ml-1m/train.csv')
+test   = pd.read_csv('data/ml-1m/test.csv')
+meta   = json.load(open('data/ml-1m/meta.json'))
 
 N_USERS = meta['n_users']
 N_ITEMS = meta['n_items']
@@ -31,8 +31,8 @@ user2idx = {int(k): int(v) for k, v in meta['user2idx'].items()}
 idx2user = {v: k for k, v in user2idx.items()}
 
 # Load gender from users.dat
-print("\nLoading user gender from data/users.dat...")
-raw_gender  = load_user_gender('data/users.dat')
+print("\nLoading user gender from data/ml-1m/users.dat...")
+raw_gender = load_user_gender('data/ml-1m/users.dat')
 
 # Map original user ids to new indexed user ids
 user_gender = {}
@@ -53,14 +53,14 @@ for _, row in test.iterrows():
 
 # ── Load environment and policy ────────────────────────────────────────
 env = RecEnv(
-    train_path='data/train.csv',
-    meta_path='data/meta.json',
+    train_path='data/ml-1m/train.csv',
+    meta_path='data/ml-1m/meta.json',
     emb_dim=CFG['emb_dim'],
     window=CFG['window'],
     fairness_lambda=CFG['fairness_lambda']
 )
 
-emb_path = 'data/bpr_item_embeddings.npy'
+emb_path = 'data/ml-1m/bpr_item_embeddings.npy'
 if os.path.exists(emb_path):
     env.load_pretrained_embeddings(np.load(emb_path))
 
@@ -124,6 +124,7 @@ print(f"{'Your RL':<20} {'see 100neg':>8} {fairness['DP']:>8.4f} {fairness['EO']
 print("-" * 50)
 
 # Save
-with open('results/user_fairness.json', 'w') as f:
+os.makedirs('results/ml-1m', exist_ok=True)
+with open('results/ml-1m/user_fairness.json', 'w') as f:
     json.dump({'model': 'RL-CF', **fairness}, f, indent=2)
-print("\nSaved to results/user_fairness.json")
+print("\nSaved to results/ml-1m/user_fairness.json")
