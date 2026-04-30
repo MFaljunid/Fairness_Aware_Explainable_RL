@@ -4,30 +4,61 @@ import torch.nn.functional as F
 import numpy as np
 
 
-class GRUStateEncoder(nn.Module):
+class TransformerStateEncoder(nn.Module):
     """
-    Step 2 — Encodes user interaction sequence into a state vector.
-    Captures temporal preference patterns.
+    Transformer-based sequential encoder.
+    Replaces GRU for better sequential recommendation.
+    Consistent with SASRec architecture.
 
     Input  : (batch, window, emb_dim)
     Output : (batch, hidden_dim)
     """
     def __init__(self, emb_dim: int, hidden_dim: int,
-                 num_layers: int = 2, dropout: float = 0.1):
+                 num_layers: int = 2, num_heads: int = 4,
+                 dropout: float = 0.2):
         super().__init__()
-        self.gru = nn.GRU(
-            input_size=emb_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
+
+        self.input_proj = nn.Linear(emb_dim, hidden_dim)
+        self.pos_emb    = nn.Embedding(512, hidden_dim)
+        self.dropout    = nn.Dropout(dropout)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
             batch_first=True,
-            dropout=dropout if num_layers > 1 else 0.0
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
         )
         self.norm       = nn.LayerNorm(hidden_dim)
         self.hidden_dim = hidden_dim
 
     def forward(self, seq: torch.Tensor) -> torch.Tensor:
-        _, h_n = self.gru(seq)
-        return self.norm(h_n[-1])
+        # seq: (batch, window, emb_dim)
+        B, W, _ = seq.shape
+
+        # Project input to hidden_dim
+        x = self.input_proj(seq)  # (B, W, hidden_dim)
+
+        # Add positional embeddings
+        positions = torch.arange(W, device=seq.device).unsqueeze(0)
+        x = self.dropout(x + self.pos_emb(positions))
+
+        # Causal mask — only attend to past items
+        mask = nn.Transformer.generate_square_subsequent_mask(
+            W, device=seq.device)
+
+        # Transformer encoding
+        out = self.transformer(x, mask=mask,
+                               is_causal=True)  # (B, W, hidden_dim)
+
+        # Use last position as state
+        state = self.norm(out[:, -1, :])  # (B, hidden_dim)
+        return state
 
 
 class FairnessConstraintLayer(nn.Module):
@@ -114,19 +145,21 @@ class ActorCriticPolicy(nn.Module):
     """
     Full policy combining all contributions:
 
-      GRUStateEncoder        — temporal user modelling
+      TransformerStateEncoder — temporal user modelling (upgraded from GRU)
       FairnessConstraintLayer — fairness IN the policy (novelty)
-      AttentionExplainer     — interpretable recommendations
+      AttentionExplainer      — interpretable recommendations
     """
     def __init__(self, emb_dim: int, n_items: int,
-                 hidden_dim: int = 256, num_gru_layers: int = 2):
+                 hidden_dim: int = 256, num_layers: int = 2):
         super().__init__()
         self.n_items    = n_items
         self.emb_dim    = emb_dim
         self.hidden_dim = hidden_dim
 
         self.item_emb       = nn.Embedding(n_items, emb_dim, padding_idx=0)
-        self.encoder        = GRUStateEncoder(emb_dim, hidden_dim, num_gru_layers)
+        self.encoder        = TransformerStateEncoder(
+                                emb_dim, hidden_dim,
+                                num_layers=num_layers, num_heads=4)
         self.trunk          = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
