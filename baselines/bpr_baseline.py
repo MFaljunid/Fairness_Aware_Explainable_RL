@@ -48,7 +48,7 @@ eval_method = BaseMethod.from_splits(
 
 # ── BPR model ──────────────────────────────────────────────────────────
 bpr = BPR(
-    k=128,
+    k=64,
     max_iter=200,
     learning_rate=0.01,
     lambda_reg=0.001,

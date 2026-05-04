@@ -21,14 +21,14 @@ print("=" * 55)
 DATA_DIR = 'data/ml-1m'
 
 CFG = {
-    'emb_dim':    128,
-    'hidden_dim': 512,
-    'window':     10,
-    'lr':         1e-3,
-    'epochs':     50,
-    'batch_size': 256,
-    'temperature': 2.0,   # KD temperature
-    'alpha':       0.5,   # balance BPR loss vs KD loss
+    'emb_dim':     64,
+    'hidden_dim':  256,
+    'window':      10,
+    'lr':          3e-3,    # ← 3x higher lr = faster convergence
+    'epochs':      50,      # ← keep same
+    'batch_size':  512,     # ← larger batch = faster per epoch
+    'temperature': 1.0,     # ← sharper targets
+    'alpha':       0.3,     # ← trust BPR more
 }
 
 # ── Load data ──────────────────────────────────────────────────────────
@@ -77,7 +77,9 @@ with torch.no_grad():
     policy.item_emb.weight.data[0].zero_()
 
 optimizer = optim.Adam(policy.parameters(), lr=CFG['lr'])
-
+optimizer = optim.Adam(policy.parameters(), lr=CFG['lr'])
+scheduler = optim.lr_scheduler.CosineAnnealingLR(
+    optimizer, T_max=CFG['epochs'], eta_min=1e-4)
 # ── Build training data ────────────────────────────────────────────────
 user_items = defaultdict(list)
 for _, row in train.iterrows():
@@ -190,6 +192,7 @@ for epoch in range(CFG['epochs']):
     avg_loss = total_loss / n_batches if n_batches > 0 else 0
     if (epoch + 1) % 5 == 0:
         print(f"Epoch {epoch+1:>3}/{CFG['epochs']} | Loss: {avg_loss:.4f}")
+    scheduler.step()
 
 # ── Save ───────────────────────────────────────────────────────────────
 os.makedirs('results/ml-1m', exist_ok=True)

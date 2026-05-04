@@ -16,8 +16,8 @@ os.makedirs('results', exist_ok=True)
 
 
 CFG = {
-    'emb_dim':         128,
-    'hidden_dim':      512,
+    'emb_dim':         64,
+    'hidden_dim':      256,
     'lr':              1e-4,
     'gamma':           0.99,
     'fairness_lambda': 0.1,
