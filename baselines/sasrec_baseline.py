@@ -20,7 +20,7 @@ CFG = {
     'window':     20,      # ← reduce from 50
     'dropout':    0.2,
     'lr':         1e-3,
-    'epochs':     50,      # ← reduce from 200
+    'epochs':     100,      # ← reduce from 200
     'batch_size': 1024,    # ← increase from 256
     'l2':         1e-5,
 }
