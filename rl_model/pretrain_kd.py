@@ -15,7 +15,7 @@ from rl_model.environment import RecEnv
 from rl_model.policy import ActorCriticPolicy
 
 print("=" * 55)
-print("Phase 1: Supervised Pre-training with BPR Distillation")
+print("Phase 1: Supervised Pre-training with SASRec Distillation")
 print("=" * 55)
 
 DATA_DIR = 'data/ml-1m'
@@ -37,16 +37,56 @@ meta    = json.load(open(f'{DATA_DIR}/meta.json'))
 N_USERS = meta['n_users']
 N_ITEMS = meta['n_items']
 
-# ── Load BPR teacher model ─────────────────────────────────────────────
-pkl_files = glob.glob('results/BPR/*.pkl')
-assert len(pkl_files) > 0, "Run bpr_baseline.py first"
-with open(sorted(pkl_files)[-1], 'rb') as f:
-    bpr_teacher = pickle.load(f)
 
-bpr_u2c = {int(k): v for k, v in bpr_teacher.uid_map.items()}
-bpr_i2c = {int(k): v for k, v in bpr_teacher.iid_map.items()}
 
-print(f"BPR teacher loaded: {len(bpr_u2c)} users, {len(bpr_i2c)} items")
+WINDOW_SASREC = 20
+
+user_history_sasrec = defaultdict(list)
+for _, row in train.sort_values('timestamp').iterrows():
+    user_history_sasrec[int(row['user_id'])].append(int(row['item_id']))
+
+class SASRecTeacher(nn.Module):
+    def __init__(self, n_items, emb_dim, hidden_dim,
+                 num_heads, num_layers, window, dropout):
+        super().__init__()
+        self.item_emb = nn.Embedding(n_items + 1, emb_dim, padding_idx=0)
+        self.pos_emb  = nn.Embedding(window + 1, emb_dim)
+        self.dropout  = nn.Dropout(dropout)
+        self.layers   = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=emb_dim, nhead=num_heads,
+                dim_feedforward=hidden_dim, dropout=dropout,
+                batch_first=True, norm_first=True,
+            ) for _ in range(num_layers)
+        ])
+        self.norm   = nn.LayerNorm(emb_dim)
+        self.window = window
+
+    def forward(self, seq):
+        B, W    = seq.shape
+        positions = torch.arange(1, W+1, device=seq.device).unsqueeze(0)
+        x = self.dropout(self.item_emb(seq) + self.pos_emb(positions))
+        mask = nn.Transformer.generate_square_subsequent_mask(
+            W, device=seq.device)
+        for layer in self.layers:
+            x = layer(x, src_mask=mask, is_causal=True)
+        return self.norm(x)
+
+    def get_scores(self, seq):
+        out   = self.forward(seq)
+        state = out[:, -1, :]           # (1, emb_dim)
+        all_items = torch.arange(
+            1, self.item_emb.num_embeddings,
+            device=seq.device)
+        item_embs = self.item_emb(all_items)  # (N_ITEMS, emb_dim)
+        scores    = (item_embs @ state.T).squeeze(-1)  # (N_ITEMS,)
+        return scores
+
+sasrec_teacher = SASRecTeacher(N_ITEMS, 64, 256, 4, 2, WINDOW_SASREC, 0.2)
+sasrec_teacher.load_state_dict(
+    torch.load('results/SASRec/sasrec_best.pt', map_location='cpu'))
+sasrec_teacher.eval()
+print(f"SASRec teacher loaded")
 
 # ── Environment ────────────────────────────────────────────────────────
 env = RecEnv(
@@ -56,7 +96,10 @@ env = RecEnv(
     window=CFG['window']
 )
 
-bpr_embeddings = np.load(f'{DATA_DIR}/bpr_item_embeddings.npy')
+bpr_embeddings = np.load(f'{DATA_DIR}/sasrec_item_embeddings.npy')
+# sasrec embeddings are (N_ITEMS+1, 64) — trim padding row
+if bpr_embeddings.shape[0] > N_ITEMS:
+    bpr_embeddings = bpr_embeddings[1:]
 if bpr_embeddings.shape[0] < N_ITEMS:
     pad = np.zeros((N_ITEMS - bpr_embeddings.shape[0],
                     bpr_embeddings.shape[1]), dtype=np.float32)
@@ -77,7 +120,6 @@ with torch.no_grad():
     policy.item_emb.weight.data[0].zero_()
 
 optimizer = optim.Adam(policy.parameters(), lr=CFG['lr'])
-optimizer = optim.Adam(policy.parameters(), lr=CFG['lr'])
 scheduler = optim.lr_scheduler.CosineAnnealingLR(
     optimizer, T_max=CFG['epochs'], eta_min=1e-4)
 # ── Build training data ────────────────────────────────────────────────
@@ -96,24 +138,21 @@ def get_item_seq(user_id):
 def bpr_loss(pos_scores, neg_scores):
     return -torch.log(
         torch.sigmoid(pos_scores - neg_scores) + 1e-9).mean()
+# ── Precompute ALL SASRec scores once ─────────────────────────────────
+print("Precomputing SASRec scores for all users (one-time)...")
+sasrec_scores_cache = np.zeros((N_USERS, N_ITEMS), dtype=np.float32)
 
-# ── Precompute ALL BPR scores once ────────────────────────────────────
-print("Precomputing BPR scores for all users (one-time)...")
-bpr_scores_cache = np.zeros((N_USERS, N_ITEMS), dtype=np.float32)
+with torch.no_grad():
+    for uid in range(N_USERS):
+        history = user_history_sasrec[uid][-WINDOW_SASREC:]
+        if len(history) < WINDOW_SASREC:
+            history = [0]*(WINDOW_SASREC - len(history)) + history
+        seq_t  = torch.LongTensor(history).unsqueeze(0)
+        scores = sasrec_teacher.get_scores(seq_t).numpy()
+        sasrec_scores_cache[uid, :len(scores)] = scores
 
-for uid in range(N_USERS):
-    if uid in bpr_u2c:
-        try:
-            raw = bpr_teacher.score(bpr_u2c[uid])
-            for item in range(N_ITEMS):
-                ci = bpr_i2c.get(item, -1)
-                if 0 <= ci < len(raw):
-                    bpr_scores_cache[uid, item] = float(raw[ci])
-        except Exception:
-            pass
-
-print(f"BPR scores cached: {bpr_scores_cache.shape}")
-bpr_scores_tensor = torch.FloatTensor(bpr_scores_cache)
+print(f"SASRec scores cached: {sasrec_scores_cache.shape}")
+bpr_scores_tensor = torch.FloatTensor(sasrec_scores_cache)
 
 # ── Pre-training with Knowledge Distillation ───────────────────────────
 print(f"Training on {len(train)} interactions")
@@ -166,8 +205,7 @@ for epoch in range(CFG['epochs']):
         neg_scores = logits.gather(1, neg_t.unsqueeze(1)).squeeze(1)
         loss_bpr   = bpr_loss(pos_scores, neg_scores)
 
-        # ── Knowledge distillation loss ────────────────────────────────
-        # Get BPR teacher scores
+    
         teacher_scores = bpr_scores_tensor[uids]
 
 

@@ -32,7 +32,7 @@ class TransformerStateEncoder(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(
             encoder_layer,
-            num_layers=num_layers,
+            num_layers=num_layers, enable_nested_tensor=False,
         )
         self.norm       = nn.LayerNorm(hidden_dim)
         self.hidden_dim = hidden_dim
